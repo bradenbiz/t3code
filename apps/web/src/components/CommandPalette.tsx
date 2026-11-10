@@ -1651,7 +1651,16 @@ function OpenCommandPaletteDialog(props: {
   actionItems.push({
     kind: "action",
     value: "action:thread-map",
-    searchTerms: ["map", "graph", "lineage", "threads", "subagents", "launched", "messages"],
+    searchTerms: [
+      "Open thread map",
+      "map",
+      "graph",
+      "lineage",
+      "threads",
+      "subagents",
+      "launched",
+      "messages",
+    ],
     title:
       paletteRouteTarget?.kind === "server"
         ? "Show this thread on the thread map"
