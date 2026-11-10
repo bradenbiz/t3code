@@ -80,19 +80,113 @@ function statusDotClass(status: string | null): string {
   }
 }
 
-function edgePath(source: ThreadMapLayoutNode, target: ThreadMapLayoutNode): string {
-  const forward = target.x > source.x;
-  const x1 = source.x + (forward ? NODE_WIDTH : NODE_WIDTH / 2) + PADDING;
-  const y1 = source.y + NODE_HEIGHT / 2 + PADDING;
-  const x2 = target.x + (forward ? 0 : NODE_WIDTH / 2) + PADDING;
-  const y2 = target.y + (forward ? NODE_HEIGHT / 2 : 0) + PADDING;
-  if (forward) {
-    const bend = (x2 - x1) / 2;
-    return `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
+type PortSide = "left" | "right" | "top";
+
+interface RoutedEdge {
+  readonly edge: ThreadMapLayoutEdge;
+  readonly path: string;
+  readonly mid: { readonly x: number; readonly y: number };
+}
+
+const edgeKey = (edge: ThreadMapLayoutEdge) =>
+  `${edge.sourceThreadId}:${edge.targetThreadId}:${edge.kind}`;
+
+/**
+ * Forward edges run right side to left side, edges back to an earlier column arc over the tops,
+ * and edges within a column loop out to the right. Each side spreads its edges by where the other
+ * end is, so edges between the same two cards run side by side instead of on top of each other.
+ */
+function routeEdges(
+  nodes: ReadonlyArray<ThreadMapLayoutNode>,
+  edges: ReadonlyArray<ThreadMapLayoutEdge>,
+): RoutedEdge[] {
+  const byId = new Map(nodes.map((entry) => [entry.node.threadId, entry]));
+  type End = {
+    edge: ThreadMapLayoutEdge;
+    node: ThreadMapLayoutNode;
+    other: ThreadMapLayoutNode;
+    side: PortSide;
+    isSource: boolean;
+  };
+  const ends = new Map<string, End[]>();
+  const sidesOf = new Map<string, { source: PortSide; target: PortSide }>();
+  const usable: ThreadMapLayoutEdge[] = [];
+  for (const edge of edges) {
+    const source = byId.get(edge.sourceThreadId);
+    const target = byId.get(edge.targetThreadId);
+    if (!source || !target) continue;
+    usable.push(edge);
+    const sides: { source: PortSide; target: PortSide } =
+      target.x > source.x
+        ? { source: "right", target: "left" }
+        : target.x < source.x
+          ? { source: "top", target: "top" }
+          : { source: "right", target: "right" };
+    sidesOf.set(edgeKey(edge), sides);
+    for (const [node, other, side, isSource] of [
+      [source, target, sides.source, true],
+      [target, source, sides.target, false],
+    ] as const) {
+      const key = `${node.node.threadId}:${side}`;
+      const list = ends.get(key) ?? [];
+      list.push({ edge, node, other, side, isSource });
+      ends.set(key, list);
+    }
   }
-  // Messages to a thread that is not further right loop out to the side so they stay visible.
-  const loop = Math.max(64, Math.abs(y2 - y1) / 3);
-  return `M ${x1 + NODE_WIDTH / 2} ${y1} C ${x1 + NODE_WIDTH / 2 + loop} ${y1}, ${x2 + NODE_WIDTH / 2 + loop} ${y2 + NODE_HEIGHT / 2}, ${x2 + NODE_WIDTH / 2} ${y2 + NODE_HEIGHT / 2}`;
+
+  const ports = new Map<string, { x: number; y: number }>();
+  for (const list of ends.values()) {
+    list.sort((a, b) => {
+      const byOther = a.side === "top" ? a.other.x - b.other.x : a.other.y - b.other.y;
+      if (byOther !== 0) return byOther;
+      return edgeKey(a.edge) < edgeKey(b.edge) ? -1 : 1;
+    });
+    list.forEach((end, index) => {
+      const share = (index + 1) / (list.length + 1);
+      const x =
+        end.side === "left"
+          ? end.node.x
+          : end.side === "right"
+            ? end.node.x + NODE_WIDTH
+            : end.node.x + NODE_WIDTH * share;
+      const y = end.side === "top" ? end.node.y : end.node.y + NODE_HEIGHT * share;
+      ports.set(`${edgeKey(end.edge)}:${end.isSource ? "s" : "t"}`, {
+        x: x + PADDING,
+        y: y + PADDING,
+      });
+    });
+  }
+
+  return usable.map((edge) => {
+    const key = edgeKey(edge);
+    const sides = sidesOf.get(key)!;
+    const p0 = ports.get(`${key}:s`)!;
+    const p3 = ports.get(`${key}:t`)!;
+    const dx = Math.abs(p3.x - p0.x);
+    const dy = Math.abs(p3.y - p0.y);
+    const reach =
+      sides.source === "right" && sides.target === "left"
+        ? Math.max(24, dx / 2)
+        : sides.source === "top"
+          ? 40 + dx * 0.15
+          : 48 + dy / 4;
+    const control = (point: { x: number; y: number }, side: PortSide) =>
+      side === "left"
+        ? { x: point.x - reach, y: point.y }
+        : side === "right"
+          ? { x: point.x + reach, y: point.y }
+          : { x: point.x, y: point.y - reach };
+    const p1 = control(p0, sides.source);
+    const p2 = control(p3, sides.target);
+    return {
+      edge,
+      path: `M ${p0.x} ${p0.y} C ${p1.x} ${p1.y}, ${p2.x} ${p2.y}, ${p3.x} ${p3.y}`,
+      mid: {
+        x: (p0.x + 3 * p1.x + 3 * p2.x + p3.x) / 8,
+        y: (p0.y + 3 * p1.y + 3 * p2.y + p3.y) / 8,
+      },
+    };
+  });
 }
 
 export function ThreadMapPage() {
@@ -406,7 +500,6 @@ function MapEdges(props: {
   nodes: ReadonlyArray<ThreadMapLayoutNode>;
   edges: ReadonlyArray<ThreadMapLayoutEdge>;
 }) {
-  const byId = new Map(props.nodes.map((entry) => [entry.node.threadId, entry]));
   return (
     <svg className="pointer-events-none absolute inset-0 size-full overflow-visible" aria-hidden>
       <defs>
@@ -425,14 +518,10 @@ function MapEdges(props: {
           </marker>
         ))}
       </defs>
-      {props.edges.map((edge) => {
-        const source = byId.get(edge.sourceThreadId);
-        const target = byId.get(edge.targetThreadId);
-        if (!source || !target) return null;
+      {routeEdges(props.nodes, props.edges).map(({ edge, path, mid }) => {
         const style = EDGE_STYLE[edge.kind];
-        const path = edgePath(source, target);
         return (
-          <g key={`${edge.sourceThreadId}:${edge.targetThreadId}:${edge.kind}`}>
+          <g key={edgeKey(edge)}>
             <path
               d={path}
               fill="none"
@@ -442,12 +531,7 @@ function MapEdges(props: {
               markerEnd={`url(#thread-map-arrow-${edge.kind})`}
             />
             {edge.kind === "messaged" && edge.messageCount > 1 ? (
-              <text
-                x={(source.x + target.x) / 2 + NODE_WIDTH / 2 + PADDING}
-                y={(source.y + target.y) / 2 + NODE_HEIGHT / 2 + PADDING - 6}
-                className="fill-warning text-3xs"
-                textAnchor="middle"
-              >
+              <text x={mid.x} y={mid.y - 6} className="fill-warning text-3xs" textAnchor="middle">
                 {edge.messageCount}×
               </text>
             ) : null}
