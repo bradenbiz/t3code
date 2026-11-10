@@ -1530,6 +1530,127 @@ const threadWorktreePathsIncludeArchivedOnRequest = Effect.gen(function* () {
   );
 });
 
+const threadMapListsLineageAndSenderEdges = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const now = yield* DateTime.now;
+  const later = DateTime.add(now, { seconds: 1 });
+  const projectId = ProjectId.make("project:thread-map");
+  const create = (
+    id: string,
+    input: { parent?: ThreadId; relationship?: "fork" | "subagent"; archived?: boolean } = {},
+  ) => {
+    const threadId = ThreadId.make(id);
+    const thread = {
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+      id: threadId,
+      projectId,
+      title: `Title for ${id}`,
+      providerInstanceId,
+      modelSelection,
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: null,
+      lineage: {
+        parentThreadId: input.parent ?? null,
+        relationshipToParent: input.relationship ?? null,
+        rootThreadId: input.parent ?? threadId,
+      },
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: input.archived === true ? now : null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    };
+    return store
+      .apply({
+        id: EventId.make(`event:${id}:created`),
+        type: "thread.created",
+        threadId,
+        occurredAt: now,
+        payload: thread,
+      })
+      .pipe(Effect.as(threadId));
+  };
+  const message = (id: string, threadId: ThreadId, at: DateTime.Utc, senderThreadId?: ThreadId) =>
+    store.apply({
+      id: EventId.make(`event:${id}:message`),
+      type: "message.updated",
+      threadId,
+      occurredAt: at,
+      payload: {
+        id: MessageId.make(id),
+        threadId,
+        runId: null,
+        nodeId: null,
+        createdBy: "agent",
+        creationSource: "server",
+        role: "user",
+        text: id,
+        attachments: [],
+        streaming: false,
+        createdAt: at,
+        updatedAt: at,
+        ...(senderThreadId === undefined ? {} : { senderThreadId }),
+      },
+    });
+
+  const director = yield* create("thread:director");
+  const subagent = yield* create("thread:subagent", { parent: director, relationship: "subagent" });
+  const launched = yield* create("thread:launched");
+  const peer = yield* create("thread:peer");
+  yield* create("thread:archived", { archived: true });
+
+  yield* message("launch", launched, now, director);
+  yield* message("follow-up", launched, later, director);
+  yield* message("peer-first", peer, now);
+  yield* message("peer-sent", peer, later, launched);
+  yield* message("self-note", director, now, director);
+
+  const all = yield* store.getThreadMap({ includeArchived: false });
+  const ours = new Set([director, subagent, launched, peer]);
+  const map = {
+    nodes: all.nodes.filter((node) => node.projectId === projectId),
+    messageEdges: all.messageEdges.filter((edge) => ours.has(edge.receiverThreadId)),
+  };
+  assert.deepEqual(
+    [...map.nodes]
+      .sort((a, b) => a.threadId.localeCompare(b.threadId))
+      .map((node) => [node.threadId, node.parentThreadId, node.relationshipToParent]),
+    [
+      [director, null, null],
+      [launched, null, null],
+      [peer, null, null],
+      [subagent, director, "subagent"],
+    ],
+  );
+  assert.deepEqual(
+    [...map.messageEdges]
+      .sort((a, b) => a.receiverThreadId.localeCompare(b.receiverThreadId))
+      .map((edge) => [
+        edge.senderThreadId,
+        edge.receiverThreadId,
+        edge.launched,
+        edge.messageCount,
+      ]),
+    [
+      [director, launched, true, 2],
+      [launched, peer, false, 1],
+    ],
+  );
+  assert.equal(
+    (yield* store.getThreadMap({ includeArchived: true })).nodes.some(
+      (node) => node.projectId === projectId && node.archived,
+    ),
+    true,
+  );
+});
+
 const commandReadsSkipSettledLeafNodes = Effect.gen(function* () {
   const store = yield* ProjectionStore.ProjectionStoreV2;
   const now = yield* DateTime.now;
@@ -2705,6 +2826,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
   it.effect(
     "worktree path and title lookups skip deleted threads, and can include archived ones",
     () => threadWorktreePathsIncludeArchivedOnRequest,
+  );
+  it.effect(
+    "thread map lists lineage and which threads launched or messaged which",
+    () => threadMapListsLineageAndSenderEdges,
   );
 
   it.effect(

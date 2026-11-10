@@ -52,6 +52,7 @@ import {
   GitForkIcon,
   MessagesSquareIcon,
   MoreHorizontalIcon,
+  NetworkIcon,
   PlusIcon,
   SquareIcon,
   UnplugIcon,
@@ -957,29 +958,52 @@ export function ThreadRelationshipsPanel(props: {
           }
           data-thread-relationships-panel
           actions={
-            canDetach ? (
-              <Menu>
-                <MenuTrigger
+            <>
+              <Tooltip>
+                <TooltipTrigger
                   render={
                     <ThreadDetailsControl
                       size="icon-xs"
                       variant="ghost"
                       part="icon"
-                      aria-label="More thread actions"
-                      disabled={busyAction !== null}
+                      aria-label="Show on the thread map"
+                      onClick={() =>
+                        void navigate({
+                          to: "/map",
+                          search: { environmentId: props.environmentId, focus: props.threadId },
+                        })
+                      }
                     />
                   }
                 >
-                  <MoreHorizontalIcon className="size-3.5" />
-                </MenuTrigger>
-                <MenuPopup align="end" className="min-w-60 max-w-(--available-width)">
-                  <MenuItem onClick={() => void detach()}>
-                    <UnplugIcon className="size-3.5" />
-                    Disconnect agent session
-                  </MenuItem>
-                </MenuPopup>
-              </Menu>
-            ) : null
+                  <NetworkIcon className="size-3.5" />
+                </TooltipTrigger>
+                <TooltipPopup side="left">Show on the thread map</TooltipPopup>
+              </Tooltip>
+              {canDetach ? (
+                <Menu>
+                  <MenuTrigger
+                    render={
+                      <ThreadDetailsControl
+                        size="icon-xs"
+                        variant="ghost"
+                        part="icon"
+                        aria-label="More thread actions"
+                        disabled={busyAction !== null}
+                      />
+                    }
+                  >
+                    <MoreHorizontalIcon className="size-3.5" />
+                  </MenuTrigger>
+                  <MenuPopup align="end" className="min-w-60 max-w-(--available-width)">
+                    <MenuItem onClick={() => void detach()}>
+                      <UnplugIcon className="size-3.5" />
+                      Disconnect agent session
+                    </MenuItem>
+                  </MenuPopup>
+                </Menu>
+              ) : null}
+            </>
           }
         >
           {delegatedFrom === undefined ? null : (

@@ -58,6 +58,7 @@ import {
   ArrowLeftIcon,
   BugIcon,
   ChartNoAxesColumnIcon,
+  NetworkIcon,
   CheckIcon,
   ChevronRightIcon,
   CornerLeftUpIcon,
@@ -1644,6 +1645,29 @@ function OpenCommandPaletteDialog(props: {
     shortcutCommand: "usage.open",
     run: async () => {
       await navigate({ to: "/usage" });
+    },
+  });
+
+  actionItems.push({
+    kind: "action",
+    value: "action:thread-map",
+    searchTerms: ["map", "graph", "lineage", "threads", "subagents", "launched", "messages"],
+    title:
+      paletteRouteTarget?.kind === "server"
+        ? "Show this thread on the thread map"
+        : "Open thread map",
+    icon: <NetworkIcon className={ITEM_ICON_CLASS} />,
+    run: async () => {
+      await navigate({
+        to: "/map",
+        search:
+          paletteRouteTarget?.kind === "server"
+            ? {
+                environmentId: paletteRouteTarget.threadRef.environmentId,
+                focus: paletteRouteTarget.threadRef.threadId,
+              }
+            : {},
+      });
     },
   });
 

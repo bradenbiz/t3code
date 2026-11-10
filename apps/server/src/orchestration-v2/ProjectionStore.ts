@@ -7,6 +7,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { makeThreadFind } from "./ThreadFind.ts";
 import type {
   OrchestrationV2ThreadLinkMetadata,
+  OrchestrationV2ThreadMap,
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
   OrchestrationV2ThreadHistoryPage,
@@ -568,6 +569,10 @@ export interface ProjectionStoreV2Shape {
   readonly getThreadLinkMetadata: (
     threadIds: ReadonlyArray<ThreadId>,
   ) => Effect.Effect<Record<ThreadId, OrchestrationV2ThreadLinkMetadata>, ProjectionStoreV2Error>;
+  /** Every thread with its lineage, and which threads' agents messaged which. */
+  readonly getThreadMap: (input: {
+    readonly includeArchived: boolean;
+  }) => Effect.Effect<OrchestrationV2ThreadMap, ProjectionStoreV2Error>;
   readonly getThreadTitles: (
     threadIds: ReadonlyArray<ThreadId>,
   ) => Effect.Effect<Record<ThreadId, string>, ProjectionStoreV2Error>;
@@ -7446,6 +7451,85 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       );
     }, Effect.mapError(shellSnapshotReadError));
 
+    const getThreadMap = Effect.fn("ProjectionStore.getThreadMap")(function* (input: {
+      readonly includeArchived: boolean;
+    }) {
+      const nodeRows = yield* sql<{
+        readonly thread_id: ThreadId;
+        readonly project_id: ProjectId;
+        readonly title: string;
+        readonly parent_thread_id: ThreadId | null;
+        readonly relationship_to_parent: "fork" | "subagent" | null;
+        readonly side_chat: number | null;
+        readonly archived_at: string | null;
+        readonly updated_at: string;
+      }>`
+        SELECT
+          thread_id,
+          project_id,
+          title,
+          CASE
+            WHEN json_extract(payload_json, '$.forkedFrom.type') = 'run'
+              THEN json_extract(payload_json, '$.forkedFrom.threadId')
+            ELSE json_extract(payload_json, '$.lineage.parentThreadId')
+          END AS parent_thread_id,
+          json_extract(payload_json, '$.lineage.relationshipToParent') AS relationship_to_parent,
+          json_extract(payload_json, '$.lineage.sideChat') AS side_chat,
+          archived_at,
+          updated_at
+        FROM orchestration_v2_projection_threads
+        WHERE deleted_at IS NULL AND (${input.includeArchived ? 1 : 0} = 1 OR archived_at IS NULL)
+      `;
+      // Matches orchestration_v2_projection_messages_sender_thread_idx, so the scan stays on it.
+      const edgeRows = yield* sql<{
+        readonly sender_thread_id: ThreadId;
+        readonly receiver_thread_id: ThreadId;
+        readonly message_count: number;
+        readonly last_message_at: string;
+        readonly launched: number;
+      }>`
+        SELECT
+          sent.sender_thread_id,
+          sent.receiver_thread_id,
+          COUNT(*) AS message_count,
+          MAX(sent.created_at) AS last_message_at,
+          MAX(sent.created_at = (
+            SELECT MIN(first.created_at)
+            FROM orchestration_v2_projection_messages first
+            WHERE first.thread_id = sent.receiver_thread_id AND first.role = 'user'
+          )) AS launched
+        FROM (
+          SELECT
+            json_extract(payload_json, '$.senderThreadId') AS sender_thread_id,
+            thread_id AS receiver_thread_id,
+            created_at
+          FROM orchestration_v2_projection_messages
+          WHERE json_extract(payload_json, '$.senderThreadId') IS NOT NULL AND role = 'user'
+        ) sent
+        WHERE sent.sender_thread_id <> sent.receiver_thread_id
+        GROUP BY sent.sender_thread_id, sent.receiver_thread_id
+      `;
+      return {
+        nodes: nodeRows.map((row) => ({
+          threadId: row.thread_id,
+          projectId: row.project_id,
+          title: row.title,
+          parentThreadId: row.parent_thread_id,
+          relationshipToParent: row.relationship_to_parent,
+          sideChat: row.side_chat === 1,
+          archived: row.archived_at !== null,
+          updatedAt: DateTime.makeUnsafe(row.updated_at),
+        })),
+        messageEdges: edgeRows.map((row) => ({
+          senderThreadId: row.sender_thread_id,
+          receiverThreadId: row.receiver_thread_id,
+          launched: row.launched === 1,
+          messageCount: row.message_count,
+          lastMessageAt: DateTime.makeUnsafe(row.last_message_at),
+        })),
+      } satisfies OrchestrationV2ThreadMap;
+    }, Effect.mapError(shellSnapshotReadError));
+
     const getThreadTitles = Effect.fn("ProjectionStore.getThreadTitles")(function* (
       threadIds: ReadonlyArray<ThreadId>,
     ) {
@@ -7626,6 +7710,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadTitles: readOnReader(getThreadTitles),
       getThreadLinkMetadata: readOnReader(getThreadLinkMetadata),
+      getThreadMap: readOnReader(getThreadMap),
       getThreadWorktreePaths: readOnReader(getThreadWorktreePaths),
       getOpenRemoteDelegatedTasks: getOpenRemoteDelegatedTasks.pipe(NodeSqliteClient.readOnly),
       getThreadProjection: readOnReader(getThreadProjection),

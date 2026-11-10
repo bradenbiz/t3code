@@ -630,6 +630,8 @@ export const ServerConfig = Schema.Struct({
    */
   shellThreadFamilies: Schema.optionalKey(Schema.Boolean),
   threadLinkMetadata: Schema.optionalKey(Schema.Boolean),
+  /** The server answers `orchestration.getThreadMap`. */
+  threadMap: Schema.optionalKey(Schema.Boolean),
   /**
    * The shell can leave older settled threads out of snapshots (`omitOlderSettled`), and
    * `getOlderSettledThreads` serves them. Only servers that also advertise `shellThreadFamilies`.

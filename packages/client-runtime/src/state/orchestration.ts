@@ -246,6 +246,13 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       staleTimeMs: 0,
       idleTtlMs: 0,
     }),
+    // Live status comes from the shell, so this only refreshes the structure on open.
+    threadMap: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:thread-map",
+      tag: ORCHESTRATION_V2_WS_METHODS.getThreadMap,
+      staleTimeMs: 0,
+      idleTtlMs: 0,
+    }),
     // Read right before deleting a worktree, so never served from cache.
     worktreeThreadIds: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:worktree-thread-ids",

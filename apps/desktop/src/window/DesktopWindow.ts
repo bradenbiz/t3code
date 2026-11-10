@@ -39,6 +39,9 @@ import * as DesktopRendererHistory from "../telemetry/DesktopRendererHistory.ts"
 import { makeQuitShortcutHandler } from "./QuitHold.ts";
 import { copyContextMenuImage } from "./ContextMenuImage.ts";
 
+/** Matches `THREAD_MAP_WINDOW_NAME` in the web app. */
+const THREAD_MAP_WINDOW_NAME = "t3-thread-map";
+
 const TITLEBAR_HEIGHT = 40;
 
 class ContextMenuImageCopyError extends Schema.TaggedError<ContextMenuImageCopyError>()(
@@ -658,7 +661,29 @@ export const make = Effect.gen(function* () {
       void runPromise(previewManager.prepareWebview(contents));
     });
 
-    window.webContents.setWindowOpenHandler(({ url }) => {
+    window.webContents.setWindowOpenHandler(({ url, frameName }) => {
+      // The web app's thread map can open beside the main window; it keeps the same preload.
+      if (
+        frameName === THREAD_MAP_WINDOW_NAME &&
+        isSameOriginRendererNavigation({ applicationUrl, navigationUrl: url }) &&
+        new URL(url).pathname === "/map"
+      ) {
+        return {
+          action: "allow",
+          overrideBrowserWindowOptions: {
+            width: 1280,
+            height: 860,
+            minWidth: 640,
+            minHeight: 480,
+            autoHideMenuBar: true,
+            title: "Thread map",
+            ...getWindowTitleBarOptions(
+              Electron.nativeTheme.shouldUseDarkColors,
+              environment.platform,
+            ),
+          },
+        };
+      }
       if (Option.isSome(ElectronShell.parseSafeExternalUrl(url))) {
         void runPromise(electronShell.openExternal(url));
       }

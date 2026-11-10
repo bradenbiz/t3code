@@ -3624,6 +3624,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   getThreadFamily: "orchestration.getThreadFamily",
   getThreadTitles: "orchestration.getThreadTitles",
   getThreadLinkMetadata: "orchestration.getThreadLinkMetadata",
+  getThreadMap: "orchestration.getThreadMap",
   getWorktreeThreadIds: "orchestration.getWorktreeThreadIds",
   getOlderSettledThreads: "orchestration.getOlderSettledThreads",
   getThreadProjection: "orchestration.getThreadProjection",
@@ -3776,6 +3777,42 @@ export const OrchestrationV2ThreadLinkMetadata = Schema.Struct({
   projectId: Schema.NullOr(ProjectId),
 });
 export type OrchestrationV2ThreadLinkMetadata = typeof OrchestrationV2ThreadLinkMetadata.Type;
+
+/** A thread on the thread map. Live status comes from the client's shells, not from here. */
+export const OrchestrationV2ThreadMapNode = Schema.Struct({
+  threadId: ThreadId,
+  projectId: ProjectId,
+  title: Schema.String,
+  parentThreadId: Schema.NullOr(ThreadId),
+  relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent"])),
+  sideChat: Schema.Boolean,
+  archived: Schema.Boolean,
+  updatedAt: Schema.DateTimeUtc,
+});
+export type OrchestrationV2ThreadMapNode = typeof OrchestrationV2ThreadMapNode.Type;
+
+/**
+ * One thread's agent messaging another. `launched` means the sender wrote the receiver's first
+ * message, as `t3_thread_launch` does; later `t3_thread_send` messages only add to `messageCount`.
+ */
+export const OrchestrationV2ThreadMapMessageEdge = Schema.Struct({
+  senderThreadId: ThreadId,
+  receiverThreadId: ThreadId,
+  launched: Schema.Boolean,
+  messageCount: NonNegativeInt,
+  lastMessageAt: Schema.DateTimeUtc,
+});
+export type OrchestrationV2ThreadMapMessageEdge = typeof OrchestrationV2ThreadMapMessageEdge.Type;
+
+export const OrchestrationV2GetThreadMapInput = Schema.Struct({
+  includeArchived: Schema.optionalKey(Schema.Boolean),
+});
+
+export const OrchestrationV2ThreadMap = Schema.Struct({
+  nodes: Schema.Array(OrchestrationV2ThreadMapNode),
+  messageEdges: Schema.Array(OrchestrationV2ThreadMapMessageEdge),
+});
+export type OrchestrationV2ThreadMap = typeof OrchestrationV2ThreadMap.Type;
 
 export const OrchestrationV2GetWorktreeThreadIdsInput = Schema.Struct({
   worktreePath: TrimmedNonEmptyString,
@@ -4306,6 +4343,10 @@ export const OrchestrationV2RpcSchemas = {
   getThreadLinkMetadata: {
     input: OrchestrationV2GetThreadTitlesInput,
     output: Schema.Record(ThreadId, OrchestrationV2ThreadLinkMetadata),
+  },
+  getThreadMap: {
+    input: OrchestrationV2GetThreadMapInput,
+    output: OrchestrationV2ThreadMap,
   },
   getWorktreeThreadIds: {
     input: OrchestrationV2GetWorktreeThreadIdsInput,

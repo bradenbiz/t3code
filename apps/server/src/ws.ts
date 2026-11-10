@@ -1976,6 +1976,7 @@ export const layerWsRpc = (
           shellResumeCompletionMarker: true,
           shellThreadFamilies: true,
           threadLinkMetadata: true,
+          threadMap: true,
           shellOlderSettled: true,
           threadResumeCompletionMarker: true,
           threadSnapshotPagination: true,
@@ -2175,6 +2176,16 @@ export const layerWsRpc = (
               (cause) =>
                 new OrchestrationV2GetShellSnapshotError({
                   message: "Failed to load thread link metadata",
+                  cause,
+                }),
+            ),
+          ),
+        [ORCHESTRATION_V2_WS_METHODS.getThreadMap]: (input) =>
+          threadManagement.getThreadMap({ includeArchived: input.includeArchived === true }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationV2GetShellSnapshotError({
+                  message: "Failed to load the thread map",
                   cause,
                 }),
             ),

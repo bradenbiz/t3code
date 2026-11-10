@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { useThreadMapOpenerBridge } from "./threadMap/threadMapWindow";
 import * as Schema from "effect/Schema";
 import {
   useEffect,
@@ -412,6 +413,7 @@ export function AppSidebarLayout({
   children: ReactNode;
   showSidebar?: boolean;
 }) {
+  useThreadMapOpenerBridge();
   const sidebarArea = workspaceAreaProps("sidebar", 0, "Threads");
   const [sidebarRouteReveal] = useState<SidebarRouteReveal>(() => ({
     observedKey: null,
