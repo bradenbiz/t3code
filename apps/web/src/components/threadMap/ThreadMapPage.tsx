@@ -581,23 +581,23 @@ function MapCanvas(props: {
   );
 }
 
-/** Tick labels skip columns so they never collide; a new day always gets one. */
+/** Rough width of a 10px tabular label, so labels can skip columns instead of overlapping. */
+const LABEL_CHAR_WIDTH = 6;
+const LABEL_GAP = 12;
+
+/** Labels skip columns that would overlap the previous one; the first label of a day names it. */
 function labeledTicks(group: ThreadMapGroup, timestampFormat: TimestampFormat) {
   const labels: { x: number; text: string }[] = [];
-  let lastX = -Infinity;
+  let lastRight = -Infinity;
   let lastDay = "";
   for (const tick of group.ticks) {
-    const date = new Date(DateTime.toEpochMillis(tick.at));
-    const day = dayFormatter.format(date);
+    const day = dayFormatter.format(new Date(DateTime.toEpochMillis(tick.at)));
     const time = formatShortTimestamp(iso(tick.at), timestampFormat);
-    if (day !== lastDay) {
-      labels.push({ x: tick.x, text: `${day} ${time}` });
-    } else if (tick.x - lastX >= SLOT_WIDTH * 3) {
-      labels.push({ x: tick.x, text: time });
-    } else {
-      continue;
-    }
-    lastX = tick.x + (day !== lastDay ? SLOT_WIDTH : 0);
+    const text = day === lastDay ? time : `${day}, ${time}`;
+    const half = (text.length * LABEL_CHAR_WIDTH) / 2;
+    if (tick.x - half < lastRight + LABEL_GAP) continue;
+    labels.push({ x: tick.x, text });
+    lastRight = tick.x + half;
     lastDay = day;
   }
   return labels;
