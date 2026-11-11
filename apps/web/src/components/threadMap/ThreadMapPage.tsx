@@ -5,6 +5,7 @@ import {
   type ThreadMapArrowKind,
   type ThreadMapGroup,
   type ThreadMapLane,
+  type ThreadMapTick,
 } from "@t3tools/client-runtime/state/thread-map";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import type {
@@ -262,6 +263,25 @@ export function ThreadMapPage() {
     messages: query.data?.messages ?? [],
   };
 
+  const tickLabels = layout === null ? [] : labeledTicks(layout.ticks, timestampFormat);
+  const groupProps = (group: ThreadMapGroup) => ({
+    group,
+    width: layout?.width ?? 0,
+    context,
+    environmentId: environmentId!,
+    projectId,
+    selected,
+    highlightThreadId,
+    onHover: (target: Selection | null, point: HoverPoint | null) =>
+      setHover(
+        target === null || point === null
+          ? null
+          : { selection: target, clientX: point.clientX, clientY: point.clientY },
+      ),
+    onSelect: setSelection,
+    onOpen: openThread,
+  });
+
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
       <div
@@ -354,26 +374,38 @@ export function ThreadMapPage() {
               width={layout.width + PADDING}
               height={layout.height + PADDING * 2}
               onBackgroundClick={() => setSelection(null)}
+              axis={<MapAxis ticks={tickLabels} />}
+              column={layout.groups.map((group) => (
+                <MapGroup
+                  key={group.lanes[0]!.node.threadId}
+                  layer="cards"
+                  {...groupProps(group)}
+                />
+              ))}
             >
+              <svg
+                className="pointer-events-none absolute left-0 top-0"
+                width={layout.width}
+                height={layout.height + PADDING * 2}
+                aria-hidden
+              >
+                {tickLabels.map((tick) => (
+                  <line
+                    key={tick.x}
+                    x1={tick.x}
+                    x2={tick.x}
+                    y1={0}
+                    y2={layout.height + PADDING * 2}
+                    strokeWidth={1}
+                    className="stroke-border/40"
+                  />
+                ))}
+              </svg>
               {layout.groups.map((group) => (
                 <MapGroup
                   key={group.lanes[0]!.node.threadId}
-                  group={group}
-                  width={layout.width}
-                  context={context}
-                  environmentId={environmentId}
-                  projectId={projectId}
-                  selected={selected}
-                  highlightThreadId={highlightThreadId}
-                  onHover={(target, point) =>
-                    setHover(
-                      target === null || point === null
-                        ? null
-                        : { selection: target, clientX: point.clientX, clientY: point.clientY },
-                    )
-                  }
-                  onSelect={setSelection}
-                  onOpen={openThread}
+                  layer="timeline"
+                  {...groupProps(group)}
                 />
               ))}
             </MapCanvas>
@@ -465,14 +497,29 @@ function MapLegend() {
   );
 }
 
+/**
+ * A pannable, zoomable timeline. The time axis stays pinned to the top and the thread cards to the
+ * left, so both stay readable however far the timeline is scrolled. It opens at the newest end.
+ */
 function MapCanvas(props: {
   width: number;
   height: number;
   onBackgroundClick: () => void;
+  axis: React.ReactNode;
+  column: React.ReactNode;
   children: React.ReactNode;
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
+  const placed = useRef(false);
+  /** Opens at the newest end; after that the person controls where the view is. */
+  const attachViewport = (node: HTMLDivElement | null) => {
+    viewportRef.current = node;
+    if (node === null || placed.current) return;
+    placed.current = true;
+    const width = node.getBoundingClientRect().width;
+    setView((current) => ({ ...current, x: Math.min(0, width - props.width) }));
+  };
   const drag = useRef<{
     x: number;
     y: number;
@@ -496,11 +543,7 @@ function MapCanvas(props: {
     const rect = viewportRef.current?.getBoundingClientRect();
     if (!rect) return;
     const scale = Math.min(1, rect.width / props.width, rect.height / props.height);
-    setView({
-      scale,
-      x: Math.max(0, (rect.width - props.width * scale) / 2),
-      y: Math.max(0, (rect.height - props.height * scale) / 2),
-    });
+    setView({ scale, x: 0, y: 0 });
   };
 
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -533,7 +576,7 @@ function MapCanvas(props: {
 
   return (
     <div
-      ref={viewportRef}
+      ref={attachViewport}
       className="relative min-h-0 min-w-0 flex-1 cursor-grab touch-none overflow-hidden select-none active:cursor-grabbing"
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -561,7 +604,42 @@ function MapCanvas(props: {
       >
         {props.children}
       </div>
-      <div className="absolute bottom-3 right-3 flex flex-col gap-1 rounded-lg border bg-popover p-1 shadow-sm">
+      <div
+        className="absolute inset-y-0 left-0 z-10 overflow-hidden border-r bg-background"
+        style={{ width: (TIMELINE_LEFT - 12) * view.scale }}
+      >
+        <div
+          className="absolute left-0 top-0 origin-top-left"
+          style={{
+            width: props.width,
+            height: props.height,
+            transform: `translate(0px, ${view.y}px) scale(${view.scale})`,
+          }}
+        >
+          {props.column}
+        </div>
+      </div>
+      <div
+        className="absolute inset-x-0 top-0 z-20 overflow-hidden border-b bg-background"
+        style={{ height: (PADDING + AXIS_HEIGHT - 8) * view.scale }}
+      >
+        <div
+          className="absolute left-0 top-0 origin-top-left"
+          style={{
+            width: props.width,
+            transform: `translate(${view.x}px, 0px) scale(${view.scale})`,
+          }}
+        >
+          {props.axis}
+        </div>
+        <div
+          className="absolute inset-y-0 left-0 flex items-center border-r bg-background px-3 text-xs font-medium text-muted-foreground"
+          style={{ width: (TIMELINE_LEFT - 12) * view.scale }}
+        >
+          Threads
+        </div>
+      </div>
+      <div className="absolute bottom-3 right-3 z-30 flex flex-col gap-1 rounded-lg border bg-popover p-1 shadow-sm">
         <Button size="icon-xs" variant="ghost" aria-label="Zoom in" onClick={() => zoomAround(1.2)}>
           <PlusIcon />
         </Button>
@@ -586,11 +664,11 @@ const LABEL_CHAR_WIDTH = 6;
 const LABEL_GAP = 12;
 
 /** Labels skip columns that would overlap the previous one; the first label of a day names it. */
-function labeledTicks(group: ThreadMapGroup, timestampFormat: TimestampFormat) {
+function labeledTicks(ticks: ReadonlyArray<ThreadMapTick>, timestampFormat: TimestampFormat) {
   const labels: { x: number; text: string }[] = [];
-  let lastRight = -Infinity;
+  let lastRight = TIMELINE_LEFT;
   let lastDay = "";
-  for (const tick of group.ticks) {
+  for (const tick of ticks) {
     const day = dayFormatter.format(new Date(DateTime.toEpochMillis(tick.at)));
     const time = formatShortTimestamp(iso(tick.at), timestampFormat);
     const text = day === lastDay ? time : `${day}, ${time}`;
@@ -603,7 +681,24 @@ function labeledTicks(group: ThreadMapGroup, timestampFormat: TimestampFormat) {
   return labels;
 }
 
+function MapAxis(props: { ticks: ReadonlyArray<{ x: number; text: string }> }) {
+  return props.ticks.map((tick) => (
+    <span
+      key={tick.x}
+      className="absolute -translate-x-1/2 text-3xs whitespace-nowrap text-muted-foreground tabular-nums"
+      style={{ left: tick.x, top: PADDING }}
+    >
+      {tick.text}
+    </span>
+  ));
+}
+
+/**
+ * One group, drawn twice: its rows' bars and arrows on the timeline, and its cards in the pinned
+ * column. Both draw the group's band so it reads as one block across the column edge.
+ */
 function MapGroup(props: {
+  layer: "timeline" | "cards";
   group: ThreadMapGroup;
   width: number;
   context: MapContext;
@@ -625,14 +720,44 @@ function MapGroup(props: {
     props.highlightThreadId === null ||
     arrow.sourceThreadId === props.highlightThreadId ||
     arrow.targetThreadId === props.highlightThreadId;
-  const ticks = labeledTicks(group, context.timestampFormat);
+  const band = (
+    <div
+      className="absolute rounded-xl border border-border/60 bg-muted/10"
+      style={{ left: 8, top: top - 6, width: props.width - 8, height: group.height + 12 }}
+    />
+  );
+
+  if (props.layer === "cards") {
+    return (
+      <>
+        {band}
+        {group.lanes.map((lane) => (
+          <LaneCard
+            key={lane.node.threadId}
+            lane={lane}
+            environmentId={props.environmentId}
+            status={context.liveStatus.get(lane.node.threadId) ?? null}
+            selected={
+              props.selected?.kind === "thread" && props.selected.threadId === lane.node.threadId
+            }
+            showProject={props.projectId === null || lane.outside}
+            onHover={(point) =>
+              props.onHover(
+                point === null ? null : { kind: "thread", threadId: lane.node.threadId },
+                point,
+              )
+            }
+            onSelect={() => props.onSelect({ kind: "thread", threadId: lane.node.threadId })}
+            onOpen={() => props.onOpen(lane.node.threadId)}
+          />
+        ))}
+      </>
+    );
+  }
 
   return (
     <>
-      <div
-        className="absolute rounded-xl border border-border/60 bg-muted/10"
-        style={{ left: 8, top: top - 6, width: props.width - 8, height: group.height + 12 }}
-      />
+      {band}
       {group.lanes.map((lane, index) =>
         index % 2 === 1 ? (
           <div
@@ -647,32 +772,12 @@ function MapGroup(props: {
           />
         ) : null,
       )}
-      {ticks.map((tick) => (
-        <span
-          key={`tick:${tick.x}`}
-          className="absolute -translate-x-1/2 text-3xs whitespace-nowrap text-muted-foreground tabular-nums"
-          style={{ left: tick.x, top: top + 6 }}
-        >
-          {tick.text}
-        </span>
-      ))}
       <svg
         className="pointer-events-none absolute left-0 top-0 overflow-visible"
         width={props.width}
         height={1}
         aria-hidden
       >
-        {ticks.map((tick) => (
-          <line
-            key={`grid:${tick.x}`}
-            x1={tick.x}
-            x2={tick.x}
-            y1={top + 22}
-            y2={top + group.height}
-            strokeWidth={1}
-            className="stroke-border/50"
-          />
-        ))}
         {group.lanes.map((lane) => {
           const y = lane.top + PADDING + lane.height / 2;
           const tone = statusTone(context.liveStatus.get(lane.node.threadId) ?? null);
@@ -772,26 +877,6 @@ function MapGroup(props: {
           );
         })}
       </svg>
-      {group.lanes.map((lane) => (
-        <LaneCard
-          key={lane.node.threadId}
-          lane={lane}
-          environmentId={props.environmentId}
-          status={context.liveStatus.get(lane.node.threadId) ?? null}
-          selected={
-            props.selected?.kind === "thread" && props.selected.threadId === lane.node.threadId
-          }
-          showProject={props.projectId === null || lane.outside}
-          onHover={(point) =>
-            props.onHover(
-              point === null ? null : { kind: "thread", threadId: lane.node.threadId },
-              point,
-            )
-          }
-          onSelect={() => props.onSelect({ kind: "thread", threadId: lane.node.threadId })}
-          onOpen={() => props.onOpen(lane.node.threadId)}
-        />
-      ))}
     </>
   );
 }

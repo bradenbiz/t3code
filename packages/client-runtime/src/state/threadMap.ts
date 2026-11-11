@@ -35,7 +35,7 @@ export interface ThreadMapArrow {
   readonly message: OrchestrationV2ThreadMapMessage | null;
 }
 
-/** A point on a group's time axis. Each event has its own, so arrows never share a column. */
+/** A point on the time axis. Each event has its own, so arrows never share a column. */
 export interface ThreadMapTick {
   readonly x: number;
   readonly at: DateTime.Utc;
@@ -44,13 +44,14 @@ export interface ThreadMapTick {
 export interface ThreadMapGroup {
   readonly top: number;
   readonly height: number;
-  readonly ticks: ReadonlyArray<ThreadMapTick>;
   readonly lanes: ReadonlyArray<ThreadMapLane>;
   readonly arrows: ReadonlyArray<ThreadMapArrow>;
 }
 
 export interface ThreadMapLayout {
   readonly groups: ReadonlyArray<ThreadMapGroup>;
+  /** One axis shared by every group. */
+  readonly ticks: ReadonlyArray<ThreadMapTick>;
   readonly width: number;
   readonly height: number;
 }
@@ -66,6 +67,7 @@ export interface ThreadMapLayoutOptions {
   readonly slotWidth: number;
   readonly laneHeight: number;
   readonly compactLaneHeight: number;
+  /** Room above the first group for the time axis. */
   readonly axisHeight: number;
   readonly groupGap: number;
 }
@@ -77,9 +79,9 @@ const lastActivity = (node: OrchestrationV2ThreadMapNode) =>
   Math.max(millis(node.updatedAt), node.lastMessageAt === null ? 0 : millis(node.lastMessageAt));
 
 /**
- * Lays threads out as a timeline: a band per connected group, a row per thread right under the
- * thread that started it, and a column per start or message in time order. Columns are evenly
- * spaced, not to scale, so arrows never share one and quiet hours take no room.
+ * Lays threads out on one timeline: a band per connected group, a row per thread right under the
+ * thread that started it, and a column per start or message in time order across every group.
+ * Columns are evenly spaced, not to scale, so arrows never share one and quiet hours take no room.
  */
 export function layoutThreadMap(
   map: OrchestrationV2ThreadMap,
@@ -158,10 +160,6 @@ export function layoutThreadMap(
       options.projectId === null || group.some((id) => all.get(id)!.projectId === options.projectId)
     );
   });
-  const groupActivity = (group: ReadonlyArray<ThreadId>) =>
-    Math.max(...group.map((id) => lastActivity(all.get(id)!)));
-  visibleGroups.sort((a, b) => groupActivity(b) - groupActivity(a));
-
   const starterOf = (threadId: ThreadId): ThreadId | null => {
     const node = all.get(threadId)!;
     if (node.parentThreadId !== null && all.has(node.parentThreadId)) return node.parentThreadId;
@@ -177,13 +175,80 @@ export function layoutThreadMap(
   const startOf = (threadId: ThreadId) =>
     launchMessageOf(threadId)?.createdAt ?? all.get(threadId)!.createdAt;
   const byStart = (a: ThreadId, b: ThreadId) => millis(startOf(a)) - millis(startOf(b));
+  const groupStart = (group: ReadonlyArray<ThreadId>) =>
+    Math.min(...group.map((id) => millis(startOf(id))));
+  // Newest first, so the top right corner is now and older groups step down and to the left.
+  visibleGroups.sort((a, b) => groupStart(b) - groupStart(a));
+
+  // One axis for every group: a column per start or message, in time order.
+  type Event =
+    | { kind: "start"; threadId: ThreadId; at: DateTime.Utc }
+    | { kind: "message"; message: OrchestrationV2ThreadMapMessage; at: DateTime.Utc };
+  const visible = new Set(visibleGroups.flat());
+  const events: Event[] = [];
+  for (const threadId of visible) {
+    if (launchMessageOf(threadId) === undefined) {
+      events.push({ kind: "start", threadId, at: startOf(threadId) });
+    }
+  }
+  for (const message of messages) {
+    if (visible.has(message.receiverThreadId)) {
+      events.push({ kind: "message", message, at: message.createdAt });
+    }
+  }
+  events.sort((a, b) => millis(a.at) - millis(b.at));
+
+  const slotX = (index: number) => options.timelineLeft + (index + 0.5) * options.slotWidth;
+  const ticks: ThreadMapTick[] = [];
+  const arrowsOf = new Map<ThreadId, ThreadMapArrow[]>();
+  const startX = new Map<ThreadId, number>();
+  const addArrow = (arrow: ThreadMapArrow) =>
+    arrowsOf.set(arrow.targetThreadId, [...(arrowsOf.get(arrow.targetThreadId) ?? []), arrow]);
+  events.forEach((event, index) => {
+    const x = slotX(index);
+    ticks.push({ x, at: event.at });
+    if (event.kind === "message") {
+      const { message } = event;
+      const launch = launchMessageOf(message.receiverThreadId) === message;
+      if (launch) startX.set(message.receiverThreadId, x);
+      addArrow({
+        key: message.messageId,
+        kind: launch ? "launched" : "messaged",
+        sourceThreadId: message.senderThreadId,
+        targetThreadId: message.receiverThreadId,
+        at: message.createdAt,
+        x,
+        message,
+      });
+      return;
+    }
+    startX.set(event.threadId, x);
+    const node = all.get(event.threadId)!;
+    if (node.parentThreadId === null || !visible.has(node.parentThreadId)) return;
+    addArrow({
+      key: `start:${event.threadId}`,
+      kind: node.relationshipToParent === "subagent" ? "subagent" : "fork",
+      sourceThreadId: node.parentThreadId,
+      targetThreadId: event.threadId,
+      at: event.at,
+      x,
+      message: firstMessageOf.get(event.threadId) ?? null,
+    });
+  });
+
+  /** The x of the last column at or before a time, so a row ends where its activity did. */
+  const xAtOrBefore = (at: number) => {
+    let found = 0;
+    for (let index = 0; index < events.length && millis(events[index]!.at) <= at; index++) {
+      found = index;
+    }
+    return slotX(found);
+  };
 
   const laid: ThreadMapGroup[] = [];
-  let top = 0;
-  let width = options.timelineLeft;
+  let top = options.axisHeight;
   for (const group of visibleGroups) {
     const members = new Set(group);
-
     const children = new Map<ThreadId, ThreadId[]>();
     const roots: ThreadId[] = [];
     for (const threadId of group) {
@@ -203,71 +268,9 @@ export function layoutThreadMap(
     // Starters can form a cycle (two threads launching each other); the oldest unreached leads.
     for (const threadId of [...group].sort(byStart)) visit(threadId, 0);
 
-    type Event =
-      | { kind: "start"; threadId: ThreadId; at: DateTime.Utc }
-      | { kind: "message"; message: OrchestrationV2ThreadMapMessage; at: DateTime.Utc };
-    const events: Event[] = [];
-    for (const threadId of group) {
-      if (launchMessageOf(threadId) === undefined) {
-        events.push({ kind: "start", threadId, at: startOf(threadId) });
-      }
-    }
-    for (const message of messages) {
-      if (members.has(message.receiverThreadId)) {
-        events.push({ kind: "message", message, at: message.createdAt });
-      }
-    }
-    events.sort((a, b) => millis(a.at) - millis(b.at));
-
-    const slotX = (index: number) => options.timelineLeft + (index + 0.5) * options.slotWidth;
-    const ticks: ThreadMapTick[] = [];
-    const arrows: ThreadMapArrow[] = [];
-    const startX = new Map<ThreadId, number>();
-    events.forEach((event, index) => {
-      const x = slotX(index);
-      ticks.push({ x, at: event.at });
-      if (event.kind === "message") {
-        const { message } = event;
-        if (launchMessageOf(message.receiverThreadId) === message) {
-          startX.set(message.receiverThreadId, x);
-        }
-        arrows.push({
-          key: message.messageId,
-          kind: launchMessageOf(message.receiverThreadId) === message ? "launched" : "messaged",
-          sourceThreadId: message.senderThreadId,
-          targetThreadId: message.receiverThreadId,
-          at: message.createdAt,
-          x,
-          message,
-        });
-        return;
-      }
-      startX.set(event.threadId, x);
-      const node = all.get(event.threadId)!;
-      const parent = node.parentThreadId;
-      if (parent === null || !members.has(parent)) return;
-      arrows.push({
-        key: `start:${event.threadId}`,
-        kind: node.relationshipToParent === "subagent" ? "subagent" : "fork",
-        sourceThreadId: parent,
-        targetThreadId: event.threadId,
-        at: event.at,
-        x,
-        message: firstMessageOf.get(event.threadId) ?? null,
-      });
-    });
-
-    /** The x of the last column at or before a time, so a row ends where its activity did. */
-    const xAtOrBefore = (at: number) => {
-      let found = 0;
-      for (let index = 0; index < events.length && millis(events[index]!.at) <= at; index++) {
-        found = index;
-      }
-      return slotX(found);
-    };
-
     const lanes: ThreadMapLane[] = [];
-    let laneTop = top + options.axisHeight;
+    const arrows: ThreadMapArrow[] = [];
+    let laneTop = top;
     for (const { threadId, depth } of order) {
       const node = all.get(threadId)!;
       const compact = node.relationshipToParent === "subagent";
@@ -283,13 +286,18 @@ export function layoutThreadMap(
         endX: Math.max(start, xAtOrBefore(lastActivity(node))) + options.slotWidth / 2,
         outside: options.projectId !== null && node.projectId !== options.projectId,
       });
+      arrows.push(...(arrowsOf.get(threadId) ?? []));
       laneTop += height;
     }
-
-    laid.push({ top, height: laneTop - top, ticks, lanes, arrows });
-    width = Math.max(width, slotX(events.length));
+    arrows.sort((a, b) => a.x - b.x);
+    laid.push({ top, height: laneTop - top, lanes, arrows });
     top = laneTop + options.groupGap;
   }
 
-  return { groups: laid, width, height: Math.max(0, top - options.groupGap) };
+  return {
+    groups: laid,
+    ticks,
+    width: slotX(events.length),
+    height: laid.length === 0 ? 0 : top - options.groupGap,
+  };
 }

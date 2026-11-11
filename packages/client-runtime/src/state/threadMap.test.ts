@@ -110,6 +110,35 @@ describe("layoutThreadMap", () => {
     expect(lanes.get(ThreadId.make("launched"))!.startX).toBe(135);
   });
 
+  it("puts every group on one time axis, the group that started last on top", () => {
+    const layout = layoutThreadMap(
+      {
+        nodes: [
+          node("old", { createdAt: 0 }),
+          node("old-child", { createdAt: 30 }),
+          node("new", { createdAt: 10 }),
+          node("new-child", { createdAt: 20 }),
+        ],
+        messages: [
+          message("old-launch", "old", "old-child", 30, true),
+          message("new-launch", "new", "new-child", 20, true),
+        ],
+      },
+      options,
+    );
+    expect(rows(layout).map(([threadId]) => threadId)).toEqual([
+      "new",
+      "new-child",
+      "old",
+      "old-child",
+    ]);
+    expect(arrows(layout).map(([, , target, x]) => [target, x])).toEqual([
+      ["new-child", 125],
+      ["old-child", 135],
+    ]);
+    expect(layout.ticks.map((tick) => tick.x)).toEqual([105, 115, 125, 135]);
+  });
+
   it("keeps only the focused group, and survives threads that launched each other", () => {
     const layout = layoutThreadMap(
       {
