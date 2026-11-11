@@ -1616,7 +1616,7 @@ const threadMapListsLineageAndSenderEdges = Effect.gen(function* () {
   const ours = new Set([director, subagent, launched, peer]);
   const map = {
     nodes: all.nodes.filter((node) => node.projectId === projectId),
-    messageEdges: all.messageEdges.filter((edge) => ours.has(edge.receiverThreadId)),
+    messages: all.messages.filter((sent) => ours.has(sent.receiverThreadId)),
   };
   assert.deepEqual(
     [...map.nodes]
@@ -1630,19 +1630,26 @@ const threadMapListsLineageAndSenderEdges = Effect.gen(function* () {
     ],
   );
   assert.deepEqual(
-    [...map.messageEdges]
-      .sort((a, b) => a.receiverThreadId.localeCompare(b.receiverThreadId))
-      .map((edge) => [
-        edge.senderThreadId,
-        edge.receiverThreadId,
-        edge.launched,
-        edge.messageCount,
+    [...map.messages]
+      .sort((a, b) => a.messageId.localeCompare(b.messageId))
+      .map((sent) => [
+        sent.messageId,
+        sent.senderThreadId,
+        sent.receiverThreadId,
+        sent.launched,
+        sent.preview,
       ]),
     [
-      [director, launched, true, 2],
-      [launched, peer, false, 1],
+      ["follow-up", director, launched, false, "follow-up"],
+      ["launch", director, launched, true, "launch"],
+      ["peer-sent", launched, peer, false, "peer-sent"],
     ],
   );
+  const counts = Object.fromEntries(
+    map.nodes.map((node) => [node.threadId, [node.messageCount, node.lastMessageAt !== null]]),
+  );
+  assert.deepEqual(counts[launched], [2, true]);
+  assert.deepEqual(counts[subagent], [0, false]);
   assert.equal(
     (yield* store.getThreadMap({ includeArchived: true })).nodes.some(
       (node) => node.projectId === projectId && node.archived,
@@ -2828,7 +2835,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     () => threadWorktreePathsIncludeArchivedOnRequest,
   );
   it.effect(
-    "thread map lists lineage and which threads launched or messaged which",
+    "thread map lists lineage and every message one thread sent another",
     () => threadMapListsLineageAndSenderEdges,
   );
 

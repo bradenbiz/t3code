@@ -7462,52 +7462,70 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         readonly relationship_to_parent: "fork" | "subagent" | null;
         readonly side_chat: number | null;
         readonly archived_at: string | null;
+        readonly created_at: string;
         readonly updated_at: string;
+        readonly message_count: number | null;
+        readonly last_message_at: string | null;
       }>`
         SELECT
-          thread_id,
-          project_id,
-          title,
+          threads.thread_id,
+          threads.project_id,
+          threads.title,
           CASE
-            WHEN json_extract(payload_json, '$.forkedFrom.type') = 'run'
-              THEN json_extract(payload_json, '$.forkedFrom.threadId')
-            ELSE json_extract(payload_json, '$.lineage.parentThreadId')
+            WHEN json_extract(threads.payload_json, '$.forkedFrom.type') = 'run'
+              THEN json_extract(threads.payload_json, '$.forkedFrom.threadId')
+            ELSE json_extract(threads.payload_json, '$.lineage.parentThreadId')
           END AS parent_thread_id,
-          json_extract(payload_json, '$.lineage.relationshipToParent') AS relationship_to_parent,
-          json_extract(payload_json, '$.lineage.sideChat') AS side_chat,
-          archived_at,
-          updated_at
-        FROM orchestration_v2_projection_threads
-        WHERE deleted_at IS NULL AND (${input.includeArchived ? 1 : 0} = 1 OR archived_at IS NULL)
+          json_extract(threads.payload_json, '$.lineage.relationshipToParent')
+            AS relationship_to_parent,
+          json_extract(threads.payload_json, '$.lineage.sideChat') AS side_chat,
+          threads.archived_at,
+          threads.created_at,
+          threads.updated_at,
+          stats.message_count,
+          stats.last_message_at
+        FROM orchestration_v2_projection_threads threads
+        LEFT JOIN (
+          SELECT thread_id, COUNT(*) AS message_count, MAX(created_at) AS last_message_at
+          FROM orchestration_v2_projection_messages
+          GROUP BY thread_id
+        ) stats ON stats.thread_id = threads.thread_id
+        WHERE threads.deleted_at IS NULL
+          AND (${input.includeArchived ? 1 : 0} = 1 OR threads.archived_at IS NULL)
       `;
       // Matches orchestration_v2_projection_messages_sender_thread_idx, so the scan stays on it.
-      const edgeRows = yield* sql<{
+      const messageRows = yield* sql<{
+        readonly message_id: MessageId;
         readonly sender_thread_id: ThreadId;
         readonly receiver_thread_id: ThreadId;
-        readonly message_count: number;
-        readonly last_message_at: string;
+        readonly created_at: string;
+        readonly preview: string | null;
         readonly launched: number;
       }>`
         SELECT
+          sent.message_id,
           sent.sender_thread_id,
           sent.receiver_thread_id,
-          COUNT(*) AS message_count,
-          MAX(sent.created_at) AS last_message_at,
-          MAX(sent.created_at = (
+          sent.created_at,
+          sent.preview,
+          sent.created_at = (
             SELECT MIN(first.created_at)
             FROM orchestration_v2_projection_messages first
             WHERE first.thread_id = sent.receiver_thread_id AND first.role = 'user'
-          )) AS launched
+          ) AS launched
         FROM (
           SELECT
+            message_id,
             json_extract(payload_json, '$.senderThreadId') AS sender_thread_id,
             thread_id AS receiver_thread_id,
-            created_at
+            created_at,
+            substr(json_extract(payload_json, '$.text'), 1, 400) AS preview
           FROM orchestration_v2_projection_messages
           WHERE json_extract(payload_json, '$.senderThreadId') IS NOT NULL AND role = 'user'
         ) sent
         WHERE sent.sender_thread_id <> sent.receiver_thread_id
-        GROUP BY sent.sender_thread_id, sent.receiver_thread_id
+        ORDER BY sent.created_at DESC
+        LIMIT 5000
       `;
       return {
         nodes: nodeRows.map((row) => ({
@@ -7518,14 +7536,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           relationshipToParent: row.relationship_to_parent,
           sideChat: row.side_chat === 1,
           archived: row.archived_at !== null,
+          createdAt: DateTime.makeUnsafe(row.created_at),
           updatedAt: DateTime.makeUnsafe(row.updated_at),
+          messageCount: row.message_count ?? 0,
+          lastMessageAt:
+            row.last_message_at === null ? null : DateTime.makeUnsafe(row.last_message_at),
         })),
-        messageEdges: edgeRows.map((row) => ({
+        messages: messageRows.toReversed().map((row) => ({
+          messageId: row.message_id,
           senderThreadId: row.sender_thread_id,
           receiverThreadId: row.receiver_thread_id,
           launched: row.launched === 1,
-          messageCount: row.message_count,
-          lastMessageAt: DateTime.makeUnsafe(row.last_message_at),
+          createdAt: DateTime.makeUnsafe(row.created_at),
+          preview: row.preview ?? "",
         })),
       } satisfies OrchestrationV2ThreadMap;
     }, Effect.mapError(shellSnapshotReadError));

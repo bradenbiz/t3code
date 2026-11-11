@@ -3787,22 +3787,28 @@ export const OrchestrationV2ThreadMapNode = Schema.Struct({
   relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent"])),
   sideChat: Schema.Boolean,
   archived: Schema.Boolean,
+  createdAt: Schema.DateTimeUtc,
   updatedAt: Schema.DateTimeUtc,
+  /** Every message in the thread, from people, agents and other threads. */
+  messageCount: NonNegativeInt,
+  lastMessageAt: Schema.NullOr(Schema.DateTimeUtc),
 });
 export type OrchestrationV2ThreadMapNode = typeof OrchestrationV2ThreadMapNode.Type;
 
 /**
- * One thread's agent messaging another. `launched` means the sender wrote the receiver's first
- * message, as `t3_thread_launch` does; later `t3_thread_send` messages only add to `messageCount`.
+ * One message a thread's agent sent to another thread. `launched` means it is the receiver's first
+ * message, as `t3_thread_launch` writes; later `t3_thread_send` messages are not.
  */
-export const OrchestrationV2ThreadMapMessageEdge = Schema.Struct({
+export const OrchestrationV2ThreadMapMessage = Schema.Struct({
+  messageId: MessageId,
   senderThreadId: ThreadId,
   receiverThreadId: ThreadId,
   launched: Schema.Boolean,
-  messageCount: NonNegativeInt,
-  lastMessageAt: Schema.DateTimeUtc,
+  createdAt: Schema.DateTimeUtc,
+  /** The start of the message text, cut to 400 characters. */
+  preview: Schema.String,
 });
-export type OrchestrationV2ThreadMapMessageEdge = typeof OrchestrationV2ThreadMapMessageEdge.Type;
+export type OrchestrationV2ThreadMapMessage = typeof OrchestrationV2ThreadMapMessage.Type;
 
 export const OrchestrationV2GetThreadMapInput = Schema.Struct({
   includeArchived: Schema.optionalKey(Schema.Boolean),
@@ -3810,7 +3816,8 @@ export const OrchestrationV2GetThreadMapInput = Schema.Struct({
 
 export const OrchestrationV2ThreadMap = Schema.Struct({
   nodes: Schema.Array(OrchestrationV2ThreadMapNode),
-  messageEdges: Schema.Array(OrchestrationV2ThreadMapMessageEdge),
+  /** The newest 5,000 messages between threads, oldest first. */
+  messages: Schema.Array(OrchestrationV2ThreadMapMessage),
 });
 export type OrchestrationV2ThreadMap = typeof OrchestrationV2ThreadMap.Type;
 

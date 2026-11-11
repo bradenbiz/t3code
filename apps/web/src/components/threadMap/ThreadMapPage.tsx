@@ -1,14 +1,30 @@
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import {
   layoutThreadMap,
-  type ThreadMapEdgeKind,
-  type ThreadMapLayoutEdge,
-  type ThreadMapLayoutNode,
+  type ThreadMapArrow,
+  type ThreadMapArrowKind,
+  type ThreadMapGroup,
+  type ThreadMapLane,
 } from "@t3tools/client-runtime/state/thread-map";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
-import type { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  OrchestrationV2ThreadMapNode,
+  ProjectId,
+  ThreadId,
+  TimestampFormat,
+} from "@t3tools/contracts";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { ExternalLinkIcon, MinusIcon, PlusIcon, ScanIcon } from "lucide-react";
+import * as DateTime from "effect/DateTime";
+import {
+  BotIcon,
+  ExternalLinkIcon,
+  MinusIcon,
+  PlusIcon,
+  ScanIcon,
+  ScanSearchIcon,
+  XIcon,
+} from "lucide-react";
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 
 import { isElectron } from "~/env";
@@ -18,6 +34,8 @@ import { usePrimaryEnvironmentId } from "~/state/environments";
 import { useProject, useProjects, useThreadShells } from "~/state/entities";
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { useEnvironmentQuery } from "~/state/query";
+import { useClientSettings } from "../../hooks/useSettings";
+import { formatRelativeTimeLabel, formatShortTimestamp } from "../../timestampFormat";
 import { threadRelationshipStatusLabel } from "../chat/ThreadRelationshipIcon";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { Button } from "../ui/button";
@@ -38,27 +56,61 @@ export interface ThreadMapSearch {
 }
 type ThreadMapSearchPatch = { [Key in keyof ThreadMapSearch]?: ThreadMapSearch[Key] | undefined };
 
+type Selection =
+  | { readonly kind: "thread"; readonly threadId: ThreadId }
+  | { readonly kind: "arrow"; readonly key: string };
+
+interface HoverPoint {
+  readonly clientX: number;
+  readonly clientY: number;
+}
+
+interface Hover {
+  readonly selection: Selection;
+  readonly clientX: number;
+  readonly clientY: number;
+}
+
 function liveStatusOf(shell: EnvironmentThreadShell): string | null {
   if (shell.hasPendingApprovals || shell.hasPendingUserInput) return "waiting";
   if (shell.runtime !== null && shell.runtime.status !== "idle") return shell.runtime.status;
   return shell.latestRun?.status ?? null;
 }
 
-const NODE_WIDTH = 232;
-const NODE_HEIGHT = 48;
-const COLUMN_WIDTH = NODE_WIDTH + 96;
-const ROW_HEIGHT = NODE_HEIGHT + 20;
-const PADDING = 48;
+const PADDING = 24;
+const CARD_COLUMN = 280;
+const INDENT = 14;
+const MAX_INDENT_DEPTH = 6;
+const TIMELINE_LEFT = PADDING + CARD_COLUMN + 24;
+const SLOT_WIDTH = 34;
+const LANE_HEIGHT = 56;
+const COMPACT_LANE_HEIGHT = 34;
+const AXIS_HEIGHT = 30;
+const GROUP_GAP = 28;
+const ARROW_HEAD = 7;
 const ALL_PROJECTS = "__all__";
 
-const EDGE_STYLE: Record<ThreadMapEdgeKind, { label: string; className: string; dash?: string }> = {
-  subagent: { label: "Delegated or subagent", className: "stroke-muted-foreground/50" },
-  fork: { label: "Forked", className: "stroke-muted-foreground/50", dash: "6 4" },
-  launched: { label: "Launched", className: "stroke-info" },
-  messaged: { label: "Messaged", className: "stroke-warning", dash: "2 4" },
+const ARROW_STYLE: Record<
+  ThreadMapArrowKind,
+  { label: string; stroke: string; fill: string; dash?: string }
+> = {
+  launched: { label: "Launched", stroke: "stroke-info", fill: "fill-info" },
+  messaged: { label: "Message", stroke: "stroke-warning", fill: "fill-warning", dash: "4 3" },
+  subagent: {
+    label: "Started a subagent",
+    stroke: "stroke-muted-foreground",
+    fill: "fill-muted-foreground",
+    dash: "1 3",
+  },
+  fork: {
+    label: "Forked",
+    stroke: "stroke-muted-foreground",
+    fill: "fill-muted-foreground",
+    dash: "6 3",
+  },
 };
 
-function statusDotClass(status: string | null): string {
+function statusTone(status: string | null): "info" | "warning" | "destructive" | "success" | null {
   switch (status) {
     case "running":
     case "in_progress":
@@ -66,127 +118,51 @@ function statusDotClass(status: string | null): string {
     case "preparing":
     case "queued":
     case "pending":
-      return "bg-info";
+      return "info";
     case "waiting":
     case "blocked":
-      return "bg-warning";
+      return "warning";
     case "failed":
     case "error":
-      return "bg-destructive";
+      return "destructive";
     case "completed":
-      return "bg-success";
+      return "success";
     default:
-      return "bg-muted-foreground/40";
+      return null;
   }
 }
+const DOT_CLASS = {
+  info: "bg-info",
+  warning: "bg-warning",
+  destructive: "bg-destructive",
+  success: "bg-success",
+} as const;
+const FILL_CLASS = {
+  info: "fill-info",
+  warning: "fill-warning",
+  destructive: "fill-destructive",
+  success: "fill-success",
+} as const;
+const BAR_CLASS = {
+  info: "stroke-info",
+  warning: "stroke-warning",
+  destructive: "stroke-destructive",
+  success: "stroke-success/60",
+} as const;
 
-type PortSide = "left" | "right" | "top";
+const titleOf = (node: OrchestrationV2ThreadMapNode | undefined) =>
+  node?.title.trim() || "Untitled thread";
+const iso = (at: DateTime.Utc) => DateTime.formatIso(at);
 
-interface RoutedEdge {
-  readonly edge: ThreadMapLayoutEdge;
-  readonly path: string;
-  readonly mid: { readonly x: number; readonly y: number };
+const dayFormatter = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+function formatWhen(at: DateTime.Utc, timestampFormat: TimestampFormat): string {
+  const date = new Date(DateTime.toEpochMillis(at));
+  return `${dayFormatter.format(date)}, ${formatShortTimestamp(iso(at), timestampFormat)}`;
 }
 
-const edgeKey = (edge: ThreadMapLayoutEdge) =>
-  `${edge.sourceThreadId}:${edge.targetThreadId}:${edge.kind}`;
-
-/**
- * Forward edges run right side to left side, edges back to an earlier column arc over the tops,
- * and edges within a column loop out to the right. Each side spreads its edges by where the other
- * end is, so edges between the same two cards run side by side instead of on top of each other.
- */
-function routeEdges(
-  nodes: ReadonlyArray<ThreadMapLayoutNode>,
-  edges: ReadonlyArray<ThreadMapLayoutEdge>,
-): RoutedEdge[] {
-  const byId = new Map(nodes.map((entry) => [entry.node.threadId, entry]));
-  type End = {
-    edge: ThreadMapLayoutEdge;
-    node: ThreadMapLayoutNode;
-    other: ThreadMapLayoutNode;
-    side: PortSide;
-    isSource: boolean;
-  };
-  const ends = new Map<string, End[]>();
-  const sidesOf = new Map<string, { source: PortSide; target: PortSide }>();
-  const usable: ThreadMapLayoutEdge[] = [];
-  for (const edge of edges) {
-    const source = byId.get(edge.sourceThreadId);
-    const target = byId.get(edge.targetThreadId);
-    if (!source || !target) continue;
-    usable.push(edge);
-    const sides: { source: PortSide; target: PortSide } =
-      target.x > source.x
-        ? { source: "right", target: "left" }
-        : target.x < source.x
-          ? { source: "top", target: "top" }
-          : { source: "right", target: "right" };
-    sidesOf.set(edgeKey(edge), sides);
-    for (const [node, other, side, isSource] of [
-      [source, target, sides.source, true],
-      [target, source, sides.target, false],
-    ] as const) {
-      const key = `${node.node.threadId}:${side}`;
-      const list = ends.get(key) ?? [];
-      list.push({ edge, node, other, side, isSource });
-      ends.set(key, list);
-    }
-  }
-
-  const ports = new Map<string, { x: number; y: number }>();
-  for (const list of ends.values()) {
-    list.sort((a, b) => {
-      const byOther = a.side === "top" ? a.other.x - b.other.x : a.other.y - b.other.y;
-      if (byOther !== 0) return byOther;
-      return edgeKey(a.edge) < edgeKey(b.edge) ? -1 : 1;
-    });
-    list.forEach((end, index) => {
-      const share = (index + 1) / (list.length + 1);
-      const x =
-        end.side === "left"
-          ? end.node.x
-          : end.side === "right"
-            ? end.node.x + NODE_WIDTH
-            : end.node.x + NODE_WIDTH * share;
-      const y = end.side === "top" ? end.node.y : end.node.y + NODE_HEIGHT * share;
-      ports.set(`${edgeKey(end.edge)}:${end.isSource ? "s" : "t"}`, {
-        x: x + PADDING,
-        y: y + PADDING,
-      });
-    });
-  }
-
-  return usable.map((edge) => {
-    const key = edgeKey(edge);
-    const sides = sidesOf.get(key)!;
-    const p0 = ports.get(`${key}:s`)!;
-    const p3 = ports.get(`${key}:t`)!;
-    const dx = Math.abs(p3.x - p0.x);
-    const dy = Math.abs(p3.y - p0.y);
-    const reach =
-      sides.source === "right" && sides.target === "left"
-        ? Math.max(24, dx / 2)
-        : sides.source === "top"
-          ? 40 + dx * 0.15
-          : 48 + dy / 4;
-    const control = (point: { x: number; y: number }, side: PortSide) =>
-      side === "left"
-        ? { x: point.x - reach, y: point.y }
-        : side === "right"
-          ? { x: point.x + reach, y: point.y }
-          : { x: point.x, y: point.y - reach };
-    const p1 = control(p0, sides.source);
-    const p2 = control(p3, sides.target);
-    return {
-      edge,
-      path: `M ${p0.x} ${p0.y} C ${p1.x} ${p1.y}, ${p2.x} ${p2.y}, ${p3.x} ${p3.y}`,
-      mid: {
-        x: (p0.x + 3 * p1.x + 3 * p2.x + p3.x) / 8,
-        y: (p0.y + 3 * p1.y + 3 * p2.y + p3.y) / 8,
-      },
-    };
-  });
+function statusLabelFor(node: OrchestrationV2ThreadMapNode, status: string | null): string {
+  if (status !== null) return threadRelationshipStatusLabel(status);
+  return node.archived ? "Archived" : "Not loaded";
 }
 
 export function ThreadMapPage() {
@@ -199,6 +175,11 @@ export function ThreadMapPage() {
   const showSubagents = search.subagents !== false;
   const showUnconnected = search.unconnected === true;
   const includeArchived = search.archived === true;
+  const timestampFormat = useClientSettings((settings) => settings.timestampFormat);
+  const [selection, setSelection] = useState<Selection | null>(
+    focusThreadId === null ? null : { kind: "thread", threadId: focusThreadId },
+  );
+  const [hover, setHover] = useState<Hover | null>(null);
 
   const query = useEnvironmentQuery(
     environmentId === null
@@ -222,10 +203,37 @@ export function ThreadMapPage() {
           focusThreadId,
           showSubagents,
           showUnconnected,
-          columnWidth: COLUMN_WIDTH,
-          rowHeight: ROW_HEIGHT,
-          groupGap: ROW_HEIGHT,
+          timelineLeft: TIMELINE_LEFT,
+          slotWidth: SLOT_WIDTH,
+          laneHeight: LANE_HEIGHT,
+          compactLaneHeight: COMPACT_LANE_HEIGHT,
+          axisHeight: AXIS_HEIGHT,
+          groupGap: GROUP_GAP,
         });
+  const lanes = new Map<ThreadId, ThreadMapLane>();
+  const arrows = new Map<string, ThreadMapArrow>();
+  for (const group of layout?.groups ?? []) {
+    for (const lane of group.lanes) lanes.set(lane.node.threadId, lane);
+    for (const arrow of group.arrows) arrows.set(arrow.key, arrow);
+  }
+  const resolve = (target: Selection | null) =>
+    target === null
+      ? null
+      : target.kind === "thread"
+        ? lanes.has(target.threadId)
+          ? target
+          : null
+        : arrows.has(target.key)
+          ? target
+          : null;
+  const selected = resolve(selection);
+  const hovered = hover === null ? null : resolve(hover.selection);
+  const highlightThreadId =
+    hovered?.kind === "thread"
+      ? hovered.threadId
+      : selected?.kind === "thread"
+        ? selected.threadId
+        : null;
 
   const updateSearch = (patch: ThreadMapSearchPatch) =>
     void navigate({
@@ -236,12 +244,23 @@ export function ThreadMapPage() {
       },
       replace: true,
     });
+  const openThread = (threadId: ThreadId) => {
+    if (environmentId !== null) openThreadFromMap(navigate, { environmentId, threadId });
+  };
 
   const openInNewWindow = () => {
     const url = new URL(window.location.href);
     window.open(url.toString(), THREAD_MAP_WINDOW_NAME, "width=1280,height=860");
   };
   const inMapWindow = typeof window !== "undefined" && window.name === THREAD_MAP_WINDOW_NAME;
+
+  const context: MapContext = {
+    lanes,
+    arrows,
+    liveStatus,
+    timestampFormat,
+    messages: query.data?.messages ?? [],
+  };
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -314,47 +333,81 @@ export function ThreadMapPage() {
           </div>
         </WorkspacePageHeader>
 
-        {environmentId === null ? (
-          <MapMessage>Connect an environment to see its threads.</MapMessage>
-        ) : query.error !== null && query.data === null ? (
-          <MapMessage>
-            This server can’t draw the thread map. Update T3 Code on it and try again.
-          </MapMessage>
-        ) : layout === null ? (
-          <MapMessage>Loading threads…</MapMessage>
-        ) : layout.nodes.length === 0 ? (
-          <MapMessage>
-            No threads have started or messaged other threads
-            {projectId === null ? "" : " in this project"} yet. Turn on Unconnected to see every
-            thread.
-          </MapMessage>
-        ) : (
-          <MapCanvas
-            key={`${environmentId}:${projectId ?? ""}:${focusThreadId ?? ""}`}
-            width={layout.width + PADDING * 2}
-            height={layout.height + NODE_HEIGHT + PADDING * 2}
-          >
-            <MapEdges nodes={layout.nodes} edges={layout.edges} />
-            {layout.nodes.map((entry) => (
-              <MapNode
-                key={entry.node.threadId}
-                entry={entry}
-                environmentId={environmentId}
-                status={liveStatus.get(entry.node.threadId) ?? null}
-                focused={entry.node.threadId === focusThreadId}
-                showProject={projectId === null || entry.outside}
-                onOpen={() =>
-                  openThreadFromMap(navigate, { environmentId, threadId: entry.node.threadId })
-                }
-                onFocus={() => updateSearch({ focus: entry.node.threadId })}
-              />
-            ))}
-          </MapCanvas>
+        <div className="flex min-h-0 flex-1">
+          {environmentId === null ? (
+            <MapMessage>Connect an environment to see its threads.</MapMessage>
+          ) : query.error !== null && query.data === null ? (
+            <MapMessage>
+              This server can’t draw the thread map. Update T3 Code on it and try again.
+            </MapMessage>
+          ) : layout === null ? (
+            <MapMessage>Loading threads…</MapMessage>
+          ) : layout.groups.length === 0 ? (
+            <MapMessage>
+              No threads have started or messaged other threads
+              {projectId === null ? "" : " in this project"} yet. Turn on Unconnected to see every
+              thread.
+            </MapMessage>
+          ) : (
+            <MapCanvas
+              key={`${environmentId}:${projectId ?? ""}:${focusThreadId ?? ""}`}
+              width={layout.width + PADDING}
+              height={layout.height + PADDING * 2}
+              onBackgroundClick={() => setSelection(null)}
+            >
+              {layout.groups.map((group) => (
+                <MapGroup
+                  key={group.lanes[0]!.node.threadId}
+                  group={group}
+                  width={layout.width}
+                  context={context}
+                  environmentId={environmentId}
+                  projectId={projectId}
+                  selected={selected}
+                  highlightThreadId={highlightThreadId}
+                  onHover={(target, point) =>
+                    setHover(
+                      target === null || point === null
+                        ? null
+                        : { selection: target, clientX: point.clientX, clientY: point.clientY },
+                    )
+                  }
+                  onSelect={setSelection}
+                  onOpen={openThread}
+                />
+              ))}
+            </MapCanvas>
+          )}
+          {selected === null || environmentId === null ? null : (
+            <DetailsPanel
+              selection={selected}
+              context={context}
+              environmentId={environmentId}
+              onSelect={setSelection}
+              onOpen={openThread}
+              onFocus={(threadId) => updateSearch({ focus: threadId })}
+              onClose={() => setSelection(null)}
+            />
+          )}
+        </div>
+        {hover === null || hovered === null ? null : (
+          <HoverCard hover={{ ...hover, selection: hovered }} context={context} />
         )}
         <MapLegend />
       </div>
     </SidebarInset>
   );
+}
+
+interface MapContext {
+  readonly lanes: ReadonlyMap<ThreadId, ThreadMapLane>;
+  readonly arrows: ReadonlyMap<string, ThreadMapArrow>;
+  readonly liveStatus: ReadonlyMap<ThreadId, string | null>;
+  readonly timestampFormat: TimestampFormat;
+  readonly messages: ReadonlyArray<{
+    readonly senderThreadId: ThreadId;
+    readonly receiverThreadId: ThreadId;
+  }>;
 }
 
 function MapToggle(props: {
@@ -381,33 +434,52 @@ function MapMessage(props: { children: React.ReactNode }) {
 function MapLegend() {
   return (
     <div className="flex shrink-0 flex-wrap items-center gap-4 border-t px-4 py-2 text-xs text-muted-foreground">
-      {(Object.keys(EDGE_STYLE) as ThreadMapEdgeKind[]).map((kind) => (
+      {(Object.keys(ARROW_STYLE) as ThreadMapArrowKind[]).map((kind) => (
         <span key={kind} className="flex items-center gap-1.5">
-          <svg width="28" height="8" aria-hidden>
+          <svg width="30" height="10" aria-hidden>
             <line
               x1="0"
-              y1="4"
-              x2="28"
-              y2="4"
+              y1="5"
+              x2="22"
+              y2="5"
               strokeWidth="2"
-              className={EDGE_STYLE[kind].className}
-              strokeDasharray={EDGE_STYLE[kind].dash}
+              className={ARROW_STYLE[kind].stroke}
+              strokeDasharray={ARROW_STYLE[kind].dash}
             />
+            <path d="M22,1 L30,5 L22,9 z" className={ARROW_STYLE[kind].fill} />
           </svg>
-          {EDGE_STYLE[kind].label}
+          {ARROW_STYLE[kind].label}
         </span>
       ))}
+      <span className="flex items-center gap-1.5">
+        <span className="flex items-center gap-1 rounded-full border border-dashed px-1.5 py-px text-3xs">
+          <BotIcon className="size-3" />
+          Subagent
+        </span>
+      </span>
       <span className="ms-auto">
-        Drag to move · pinch or Ctrl+scroll to zoom · double-click a thread to focus it
+        Oldest on the left, one column per event · hover for details · click to inspect ·
+        double-click to open
       </span>
     </div>
   );
 }
 
-function MapCanvas(props: { width: number; height: number; children: React.ReactNode }) {
+function MapCanvas(props: {
+  width: number;
+  height: number;
+  onBackgroundClick: () => void;
+  children: React.ReactNode;
+}) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
-  const drag = useRef<{ x: number; y: number; originX: number; originY: number } | null>(null);
+  const drag = useRef<{
+    x: number;
+    y: number;
+    originX: number;
+    originY: number;
+    moved: boolean;
+  } | null>(null);
 
   const zoomAround = (factor: number, clientX?: number, clientY?: number) => {
     const rect = viewportRef.current?.getBoundingClientRect();
@@ -426,33 +498,46 @@ function MapCanvas(props: { width: number; height: number; children: React.React
     const scale = Math.min(1, rect.width / props.width, rect.height / props.height);
     setView({
       scale,
-      x: (rect.width - props.width * scale) / 2,
+      x: Math.max(0, (rect.width - props.width * scale) / 2),
       y: Math.max(0, (rect.height - props.height * scale) / 2),
     });
   };
 
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0 || (event.target as HTMLElement).closest("[data-map-node]")) return;
+    if (event.button !== 0 || (event.target as Element).closest("[data-map-item]")) return;
     event.currentTarget.setPointerCapture(event.pointerId);
-    drag.current = { x: event.clientX, y: event.clientY, originX: view.x, originY: view.y };
+    drag.current = {
+      x: event.clientX,
+      y: event.clientY,
+      originX: view.x,
+      originY: view.y,
+      moved: false,
+    };
   };
   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     const start = drag.current;
     if (start === null) return;
+    if (Math.abs(event.clientX - start.x) + Math.abs(event.clientY - start.y) > 3) {
+      start.moved = true;
+    }
     setView((current) => ({
       ...current,
       x: start.originX + event.clientX - start.x,
       y: start.originY + event.clientY - start.y,
     }));
   };
+  const onPointerUp = () => {
+    if (drag.current !== null && !drag.current.moved) props.onBackgroundClick();
+    drag.current = null;
+  };
 
   return (
     <div
       ref={viewportRef}
-      className="relative min-h-0 flex-1 cursor-grab touch-none overflow-hidden select-none active:cursor-grabbing"
+      className="relative min-h-0 min-w-0 flex-1 cursor-grab touch-none overflow-hidden select-none active:cursor-grabbing"
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
-      onPointerUp={() => (drag.current = null)}
+      onPointerUp={onPointerUp}
       onPointerCancel={() => (drag.current = null)}
       onWheel={(event) => {
         if (event.ctrlKey || event.metaKey) {
@@ -496,104 +581,300 @@ function MapCanvas(props: { width: number; height: number; children: React.React
   );
 }
 
-function MapEdges(props: {
-  nodes: ReadonlyArray<ThreadMapLayoutNode>;
-  edges: ReadonlyArray<ThreadMapLayoutEdge>;
+/** Tick labels skip columns so they never collide; a new day always gets one. */
+function labeledTicks(group: ThreadMapGroup, timestampFormat: TimestampFormat) {
+  const labels: { x: number; text: string }[] = [];
+  let lastX = -Infinity;
+  let lastDay = "";
+  for (const tick of group.ticks) {
+    const date = new Date(DateTime.toEpochMillis(tick.at));
+    const day = dayFormatter.format(date);
+    const time = formatShortTimestamp(iso(tick.at), timestampFormat);
+    if (day !== lastDay) {
+      labels.push({ x: tick.x, text: `${day} ${time}` });
+    } else if (tick.x - lastX >= SLOT_WIDTH * 3) {
+      labels.push({ x: tick.x, text: time });
+    } else {
+      continue;
+    }
+    lastX = tick.x + (day !== lastDay ? SLOT_WIDTH : 0);
+    lastDay = day;
+  }
+  return labels;
+}
+
+function MapGroup(props: {
+  group: ThreadMapGroup;
+  width: number;
+  context: MapContext;
+  environmentId: EnvironmentId;
+  projectId: ProjectId | null;
+  selected: Selection | null;
+  highlightThreadId: ThreadId | null;
+  onHover: (target: Selection | null, point: HoverPoint | null) => void;
+  onSelect: (target: Selection) => void;
+  onOpen: (threadId: ThreadId) => void;
 }) {
+  const { group, context } = props;
+  const top = group.top + PADDING;
+  const laneCenter = (threadId: ThreadId) => {
+    const lane = context.lanes.get(threadId)!;
+    return lane.top + PADDING + lane.height / 2;
+  };
+  const touches = (arrow: ThreadMapArrow) =>
+    props.highlightThreadId === null ||
+    arrow.sourceThreadId === props.highlightThreadId ||
+    arrow.targetThreadId === props.highlightThreadId;
+  const ticks = labeledTicks(group, context.timestampFormat);
+
   return (
-    <svg className="pointer-events-none absolute inset-0 size-full overflow-visible" aria-hidden>
-      <defs>
-        {(Object.keys(EDGE_STYLE) as ThreadMapEdgeKind[]).map((kind) => (
-          <marker
-            key={kind}
-            id={`thread-map-arrow-${kind}`}
-            viewBox="0 0 8 8"
-            refX="7"
-            refY="4"
-            markerWidth="7"
-            markerHeight="7"
-            orient="auto-start-reverse"
-          >
-            <path d="M0,0 L8,4 L0,8 z" stroke="none" className={fillFor(kind)} />
-          </marker>
+    <>
+      <div
+        className="absolute rounded-xl border border-border/60 bg-muted/10"
+        style={{ left: 8, top: top - 6, width: props.width - 8, height: group.height + 12 }}
+      />
+      {group.lanes.map((lane, index) =>
+        index % 2 === 1 ? (
+          <div
+            key={`stripe:${lane.node.threadId}`}
+            className="absolute bg-muted/25"
+            style={{
+              left: TIMELINE_LEFT,
+              top: lane.top + PADDING,
+              width: props.width - TIMELINE_LEFT,
+              height: lane.height,
+            }}
+          />
+        ) : null,
+      )}
+      {ticks.map((tick) => (
+        <span
+          key={`tick:${tick.x}`}
+          className="absolute -translate-x-1/2 text-3xs whitespace-nowrap text-muted-foreground tabular-nums"
+          style={{ left: tick.x, top: top + 6 }}
+        >
+          {tick.text}
+        </span>
+      ))}
+      <svg
+        className="pointer-events-none absolute left-0 top-0 overflow-visible"
+        width={props.width}
+        height={1}
+        aria-hidden
+      >
+        {ticks.map((tick) => (
+          <line
+            key={`grid:${tick.x}`}
+            x1={tick.x}
+            x2={tick.x}
+            y1={top + 22}
+            y2={top + group.height}
+            strokeWidth={1}
+            className="stroke-border/50"
+          />
         ))}
-      </defs>
-      {routeEdges(props.nodes, props.edges).map(({ edge, path, mid }) => {
-        const style = EDGE_STYLE[edge.kind];
-        return (
-          <g key={edgeKey(edge)}>
-            <path
-              d={path}
-              fill="none"
-              strokeWidth={edge.kind === "messaged" ? 1.5 : 2}
-              className={style.className}
-              strokeDasharray={style.dash}
-              markerEnd={`url(#thread-map-arrow-${edge.kind})`}
-            />
-            {edge.kind === "messaged" && edge.messageCount > 1 ? (
-              <text x={mid.x} y={mid.y - 6} className="fill-warning text-3xs" textAnchor="middle">
-                {edge.messageCount}×
-              </text>
-            ) : null}
-          </g>
-        );
-      })}
-    </svg>
+        {group.lanes.map((lane) => {
+          const y = lane.top + PADDING + lane.height / 2;
+          const tone = statusTone(context.liveStatus.get(lane.node.threadId) ?? null);
+          const dim =
+            props.highlightThreadId !== null && props.highlightThreadId !== lane.node.threadId;
+          return (
+            <g key={`bar:${lane.node.threadId}`} opacity={dim ? 0.5 : 1}>
+              <line
+                x1={lane.startX}
+                x2={lane.endX}
+                y1={y}
+                y2={y}
+                strokeLinecap="round"
+                strokeWidth={lane.compact ? 2 : 4}
+                strokeDasharray={lane.compact ? "2 4" : undefined}
+                className={tone === null ? "stroke-muted-foreground/40" : BAR_CLASS[tone]}
+              />
+              <circle
+                cx={lane.startX}
+                cy={y}
+                r={lane.compact ? 3 : 4.5}
+                className={cn(
+                  "stroke-background",
+                  tone === null ? "fill-muted-foreground" : FILL_CLASS[tone],
+                )}
+                strokeWidth={1.5}
+              />
+              <line
+                data-map-item
+                x1={lane.startX}
+                x2={lane.endX}
+                y1={y}
+                y2={y}
+                stroke="transparent"
+                strokeWidth={12}
+                className="pointer-events-auto cursor-pointer"
+                onPointerMove={(event) =>
+                  props.onHover({ kind: "thread", threadId: lane.node.threadId }, event)
+                }
+                onPointerLeave={() => props.onHover(null, null)}
+                onClick={() => props.onSelect({ kind: "thread", threadId: lane.node.threadId })}
+                onDoubleClick={() => props.onOpen(lane.node.threadId)}
+              />
+            </g>
+          );
+        })}
+        {group.arrows.map((arrow) => {
+          const y1 = laneCenter(arrow.sourceThreadId);
+          const y2 = laneCenter(arrow.targetThreadId);
+          const down = y2 > y1;
+          const tip = y2 + (down ? -4 : 4);
+          const base = tip + (down ? -ARROW_HEAD : ARROW_HEAD);
+          const style = ARROW_STYLE[arrow.kind];
+          const isSelected = props.selected?.kind === "arrow" && props.selected.key === arrow.key;
+          return (
+            <g key={arrow.key} opacity={touches(arrow) || isSelected ? 1 : 0.2}>
+              {isSelected ? (
+                <line
+                  x1={arrow.x}
+                  x2={arrow.x}
+                  y1={y1}
+                  y2={tip}
+                  strokeWidth={8}
+                  strokeLinecap="round"
+                  className="stroke-ring/40"
+                />
+              ) : null}
+              <circle cx={arrow.x} cy={y1} r={3} className={style.fill} />
+              <line
+                x1={arrow.x}
+                x2={arrow.x}
+                y1={y1}
+                y2={base}
+                strokeWidth={2}
+                strokeDasharray={style.dash}
+                className={style.stroke}
+              />
+              <path
+                d={`M ${arrow.x - 5} ${base} L ${arrow.x} ${tip} L ${arrow.x + 5} ${base} z`}
+                className={style.fill}
+              />
+              <line
+                data-map-item
+                x1={arrow.x}
+                x2={arrow.x}
+                y1={y1}
+                y2={tip}
+                stroke="transparent"
+                strokeWidth={14}
+                className="pointer-events-auto cursor-pointer"
+                onPointerMove={(event) => props.onHover({ kind: "arrow", key: arrow.key }, event)}
+                onPointerLeave={() => props.onHover(null, null)}
+                onClick={() => props.onSelect({ kind: "arrow", key: arrow.key })}
+                onDoubleClick={() => props.onOpen(arrow.targetThreadId)}
+              />
+            </g>
+          );
+        })}
+      </svg>
+      {group.lanes.map((lane) => (
+        <LaneCard
+          key={lane.node.threadId}
+          lane={lane}
+          environmentId={props.environmentId}
+          status={context.liveStatus.get(lane.node.threadId) ?? null}
+          selected={
+            props.selected?.kind === "thread" && props.selected.threadId === lane.node.threadId
+          }
+          showProject={props.projectId === null || lane.outside}
+          onHover={(point) =>
+            props.onHover(
+              point === null ? null : { kind: "thread", threadId: lane.node.threadId },
+              point,
+            )
+          }
+          onSelect={() => props.onSelect({ kind: "thread", threadId: lane.node.threadId })}
+          onOpen={() => props.onOpen(lane.node.threadId)}
+        />
+      ))}
+    </>
   );
 }
 
-function fillFor(kind: ThreadMapEdgeKind): string {
-  return kind === "launched"
-    ? "fill-info"
-    : kind === "messaged"
-      ? "fill-warning"
-      : "fill-muted-foreground/50";
-}
-
-function MapNode(props: {
-  entry: ThreadMapLayoutNode;
+function LaneCard(props: {
+  lane: ThreadMapLane;
   environmentId: EnvironmentId;
   status: string | null;
-  focused: boolean;
+  selected: boolean;
   showProject: boolean;
+  onHover: (point: HoverPoint | null) => void;
+  onSelect: () => void;
   onOpen: () => void;
-  onFocus: () => void;
 }) {
-  const { node } = props.entry;
+  const { lane } = props;
+  const { node } = lane;
   const project = useProject(
     props.showProject ? scopeProjectRef(props.environmentId, node.projectId) : null,
   );
-  const statusLabel =
-    props.status === null
-      ? node.archived
-        ? "Archived"
-        : "Not loaded"
-      : threadRelationshipStatusLabel(props.status);
+  const statusLabel = statusLabelFor(node, props.status);
+  const tone = statusTone(props.status);
+  const indent = Math.min(lane.depth, MAX_INDENT_DEPTH) * INDENT;
+  const common = {
+    type: "button" as const,
+    "data-map-item": true,
+    "aria-label": `${titleOf(node)}, ${lane.compact ? "subagent, " : ""}${statusLabel}`,
+    onClick: props.onSelect,
+    onDoubleClick: props.onOpen,
+    onPointerMove: (event: React.PointerEvent) => props.onHover(event),
+    onPointerLeave: () => props.onHover(null),
+  };
+
+  if (lane.compact) {
+    return (
+      <button
+        {...common}
+        className={cn(
+          "absolute flex items-center gap-1.5 rounded-full border border-dashed border-muted-foreground/40 bg-background px-2.5 text-left text-xs text-muted-foreground transition-colors hover:border-foreground/40 hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring",
+          props.selected && "border-solid border-info text-foreground ring-2 ring-info/30",
+          (lane.outside || node.archived) && "opacity-60",
+        )}
+        style={{
+          left: PADDING + indent,
+          top: lane.top + PADDING + 4,
+          width: CARD_COLUMN - indent,
+          height: lane.height - 8,
+        }}
+      >
+        <BotIcon className="size-3.5 shrink-0" />
+        <span className="min-w-0 flex-1 truncate">{titleOf(node)}</span>
+        <span
+          className={cn(
+            "size-1.5 shrink-0 rounded-full",
+            tone === null ? "bg-muted-foreground/40" : DOT_CLASS[tone],
+          )}
+        />
+      </button>
+    );
+  }
+
   return (
     <button
-      type="button"
-      data-map-node
-      aria-label={`${node.title.trim() || "Untitled thread"}, ${statusLabel}`}
-      onClick={props.onOpen}
-      onDoubleClick={props.onFocus}
+      {...common}
       className={cn(
         "absolute flex items-center gap-2 rounded-lg border bg-card px-3 text-left text-sm shadow-xs transition-colors hover:border-foreground/30 hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring",
-        props.focused && "border-info ring-2 ring-info/40",
-        (props.entry.outside || node.archived) && "opacity-60",
+        props.selected && "border-info ring-2 ring-info/40",
+        (lane.outside || node.archived) && "opacity-60",
       )}
       style={{
-        left: props.entry.x + PADDING,
-        top: props.entry.y + PADDING,
-        width: NODE_WIDTH,
-        height: NODE_HEIGHT,
+        left: PADDING + indent,
+        top: lane.top + PADDING + 4,
+        width: CARD_COLUMN - indent,
+        height: lane.height - 8,
       }}
     >
       <span
-        aria-label={statusLabel}
-        className={cn("size-2 shrink-0 rounded-full", statusDotClass(props.status))}
+        className={cn(
+          "size-2 shrink-0 rounded-full",
+          tone === null ? "bg-muted-foreground/40" : DOT_CLASS[tone],
+        )}
       />
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate font-medium">{node.title.trim() || "Untitled thread"}</span>
+        <span className="truncate font-medium">{titleOf(node)}</span>
         <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
           {props.showProject && project ? (
             <>
@@ -606,5 +887,281 @@ function MapNode(props: {
         </span>
       </span>
     </button>
+  );
+}
+
+function threadStats(threadId: ThreadId, context: MapContext) {
+  let sent = 0;
+  let received = 0;
+  for (const message of context.messages) {
+    if (message.senderThreadId === threadId) sent++;
+    if (message.receiverThreadId === threadId) received++;
+  }
+  return { sent, received };
+}
+
+function arrowSummary(arrow: ThreadMapArrow, context: MapContext): string {
+  const source = titleOf(context.lanes.get(arrow.sourceThreadId)?.node);
+  const target = titleOf(context.lanes.get(arrow.targetThreadId)?.node);
+  switch (arrow.kind) {
+    case "launched":
+      return `${source} launched ${target}`;
+    case "messaged":
+      return `${source} messaged ${target}`;
+    case "subagent":
+      return `${source} started subagent ${target}`;
+    case "fork":
+      return `${target} was forked from ${source}`;
+  }
+}
+
+function HoverCard(props: { hover: Hover; context: MapContext }) {
+  const { selection, clientX, clientY } = props.hover;
+  const { context } = props;
+  const left = Math.min(clientX + 14, window.innerWidth - 336);
+  const top = Math.min(clientY + 14, window.innerHeight - 200);
+  return (
+    <div
+      role="tooltip"
+      className="pointer-events-none fixed z-50 w-80 rounded-lg border bg-popover p-3 text-xs text-popover-foreground shadow-lg"
+      style={{ left, top }}
+    >
+      {selection.kind === "thread" ? (
+        <ThreadSummary threadId={selection.threadId} context={context} compact />
+      ) : (
+        <ArrowSummary arrow={context.arrows.get(selection.key)!} context={context} compact />
+      )}
+    </div>
+  );
+}
+
+function Fact(props: { label: string; children: React.ReactNode }) {
+  return (
+    <>
+      <dt className="text-muted-foreground">{props.label}</dt>
+      <dd className="min-w-0 tabular-nums">{props.children}</dd>
+    </>
+  );
+}
+
+function When(props: { at: DateTime.Utc; timestampFormat: TimestampFormat }) {
+  return (
+    <>
+      {formatWhen(props.at, props.timestampFormat)}
+      <span className="text-muted-foreground"> · {formatRelativeTimeLabel(iso(props.at))}</span>
+    </>
+  );
+}
+
+function ThreadSummary(props: { threadId: ThreadId; context: MapContext; compact?: boolean }) {
+  const { context } = props;
+  const lane = context.lanes.get(props.threadId)!;
+  const { node } = lane;
+  const status = context.liveStatus.get(node.threadId) ?? null;
+  const { sent, received } = threadStats(node.threadId, context);
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-1.5 font-medium">
+        {lane.compact ? <BotIcon className="size-3.5 shrink-0 text-muted-foreground" /> : null}
+        <span className={props.compact ? "truncate" : "text-sm"}>{titleOf(node)}</span>
+      </div>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+        <Fact label="Kind">
+          {lane.compact ? "Subagent" : node.relationshipToParent === "fork" ? "Fork" : "Thread"}
+        </Fact>
+        <Fact label="Status">{statusLabelFor(node, status)}</Fact>
+        <Fact label="Created">
+          <When at={node.createdAt} timestampFormat={context.timestampFormat} />
+        </Fact>
+        <Fact label="Last message">
+          {node.lastMessageAt === null ? (
+            "None"
+          ) : (
+            <When at={node.lastMessageAt} timestampFormat={context.timestampFormat} />
+          )}
+        </Fact>
+        <Fact label="Messages">{node.messageCount.toLocaleString()}</Fact>
+        <Fact label="To other threads">{sent.toLocaleString()}</Fact>
+        <Fact label="From other threads">{received.toLocaleString()}</Fact>
+      </dl>
+    </div>
+  );
+}
+
+function ArrowSummary(props: { arrow: ThreadMapArrow; context: MapContext; compact?: boolean }) {
+  const { arrow, context } = props;
+  const preview = arrow.message?.preview.trim() ?? "";
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-1.5 font-medium">
+        <svg width="10" height="10" aria-hidden>
+          <circle cx="5" cy="5" r="4" className={ARROW_STYLE[arrow.kind].fill} />
+        </svg>
+        {ARROW_STYLE[arrow.kind].label}
+      </div>
+      <p>{arrowSummary(arrow, context)}</p>
+      <p className="text-muted-foreground">
+        <When at={arrow.at} timestampFormat={context.timestampFormat} />
+      </p>
+      {preview.length === 0 ? null : (
+        <p
+          className={cn(
+            "rounded-md border bg-muted/30 p-2 wrap-break-word whitespace-pre-wrap",
+            props.compact && "line-clamp-4",
+          )}
+        >
+          {preview}
+          {arrow.message !== null && arrow.message.preview.length >= 400 ? "…" : ""}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function DetailsPanel(props: {
+  selection: Selection;
+  context: MapContext;
+  environmentId: EnvironmentId;
+  onSelect: (target: Selection) => void;
+  onOpen: (threadId: ThreadId) => void;
+  onFocus: (threadId: ThreadId) => void;
+  onClose: () => void;
+}) {
+  const { selection, context } = props;
+  return (
+    <aside className="flex w-88 shrink-0 flex-col overflow-y-auto border-l bg-background">
+      <div className="flex items-center justify-between border-b px-3 py-2 text-xs font-medium text-muted-foreground">
+        {selection.kind === "thread" ? "Thread details" : "Event details"}
+        <Button size="icon-xs" variant="ghost" aria-label="Close details" onClick={props.onClose}>
+          <XIcon />
+        </Button>
+      </div>
+      <div className="flex flex-col gap-4 p-3 text-xs">
+        {selection.kind === "thread" ? (
+          <ThreadDetails threadId={selection.threadId} {...props} />
+        ) : (
+          <ArrowDetails arrow={context.arrows.get(selection.key)!} {...props} />
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function ThreadLink(props: {
+  threadId: ThreadId;
+  context: MapContext;
+  onSelect: (target: Selection) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="min-w-0 truncate text-left font-medium text-foreground underline-offset-2 hover:underline"
+      onClick={() => props.onSelect({ kind: "thread", threadId: props.threadId })}
+    >
+      {titleOf(props.context.lanes.get(props.threadId)?.node)}
+    </button>
+  );
+}
+
+function ThreadDetails(props: {
+  threadId: ThreadId;
+  context: MapContext;
+  onSelect: (target: Selection) => void;
+  onOpen: (threadId: ThreadId) => void;
+  onFocus: (threadId: ThreadId) => void;
+}) {
+  const { context, threadId } = props;
+  const events = [...context.arrows.values()]
+    .filter((arrow) => arrow.sourceThreadId === threadId || arrow.targetThreadId === threadId)
+    .toSorted((a, b) => DateTime.toEpochMillis(b.at) - DateTime.toEpochMillis(a.at));
+  return (
+    <>
+      <ThreadSummary threadId={threadId} context={context} />
+      <div className="flex gap-2">
+        <Button size="xs" onClick={() => props.onOpen(threadId)}>
+          <ExternalLinkIcon />
+          Open thread
+        </Button>
+        <Button size="xs" variant="outline" onClick={() => props.onFocus(threadId)}>
+          <ScanSearchIcon />
+          Show only its group
+        </Button>
+      </div>
+      <section className="flex flex-col gap-1.5">
+        <h3 className="font-medium text-muted-foreground">
+          Starts and messages ({events.length.toLocaleString()})
+        </h3>
+        {events.length === 0 ? (
+          <p className="text-muted-foreground">No other thread started or messaged this one.</p>
+        ) : (
+          <ol className="flex flex-col gap-1">
+            {events.map((arrow) => {
+              const outgoing = arrow.sourceThreadId === threadId;
+              const other = outgoing ? arrow.targetThreadId : arrow.sourceThreadId;
+              return (
+                <li key={arrow.key}>
+                  <button
+                    type="button"
+                    className="flex w-full flex-col gap-0.5 rounded-md border px-2 py-1.5 text-left hover:bg-accent"
+                    onClick={() => props.onSelect({ kind: "arrow", key: arrow.key })}
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <svg width="8" height="8" aria-hidden>
+                        <circle cx="4" cy="4" r="3.5" className={ARROW_STYLE[arrow.kind].fill} />
+                      </svg>
+                      <span className="text-muted-foreground">
+                        {ARROW_STYLE[arrow.kind].label} {outgoing ? "to" : "from"}
+                      </span>
+                      <span className="min-w-0 truncate font-medium">
+                        {titleOf(context.lanes.get(other)?.node)}
+                      </span>
+                    </span>
+                    <span className="text-muted-foreground tabular-nums">
+                      {formatWhen(arrow.at, context.timestampFormat)}
+                    </span>
+                    {arrow.message !== null && arrow.message.preview.trim().length > 0 ? (
+                      <span className="line-clamp-2 text-muted-foreground">
+                        {arrow.message.preview.trim()}
+                      </span>
+                    ) : null}
+                  </button>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </section>
+    </>
+  );
+}
+
+function ArrowDetails(props: {
+  arrow: ThreadMapArrow;
+  context: MapContext;
+  onSelect: (target: Selection) => void;
+  onOpen: (threadId: ThreadId) => void;
+}) {
+  const { arrow, context } = props;
+  return (
+    <>
+      <ArrowSummary arrow={arrow} context={context} />
+      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+        <Fact label="From">
+          <ThreadLink threadId={arrow.sourceThreadId} context={context} onSelect={props.onSelect} />
+        </Fact>
+        <Fact label="To">
+          <ThreadLink threadId={arrow.targetThreadId} context={context} onSelect={props.onSelect} />
+        </Fact>
+      </dl>
+      <div className="flex flex-wrap gap-2">
+        <Button size="xs" onClick={() => props.onOpen(arrow.targetThreadId)}>
+          <ExternalLinkIcon />
+          Open receiving thread
+        </Button>
+        <Button size="xs" variant="outline" onClick={() => props.onOpen(arrow.sourceThreadId)}>
+          Open sending thread
+        </Button>
+      </div>
+    </>
   );
 }
